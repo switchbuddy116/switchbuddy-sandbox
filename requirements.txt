@@ -1,2 +1,2 @@
 flask==3.0.3
-twilio==9.0.0
+twilio==9.7.0
