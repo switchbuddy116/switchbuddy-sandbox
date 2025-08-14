@@ -1,8 +1,36 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
+import redis
 import os
 
+# Connect to Redis
+redis_url = os.environ.get("REDIS_URL")
+r = redis.from_url(redis_url)
+
+@app.route("/set_session")
+def set_session():
+    r.set("test_key", "Hello from Redis!")
+    return "Session set!", 200
+
+@app.route("/get_session")
+def get_session():
+    value = r.get("test_key")
+    return f"Value from Redis: {value}", 200
+
+from flask import Flask, request, session
+from flask_session import Session
+
+
+
 app = Flask(__name__)
+# Redis configuration
+app.config["SESSION_TYPE"] = "redis"
+app.config["SESSION_REDIS"] = redis.from_url(os.environ.get("REDIS_URL"))
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev_secret")  # Change for production
+
+# Initialize session
+Session(app)
+
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -15,9 +43,9 @@ def whatsapp_webhook():
     msg = resp.message()
 
     if "hi" in incoming_msg:
-        msg.body("Hi! Please send me a photo of your electricity bill to get started.")
+        msg.body("Hi! I'm SwitchBuddy, please send me a photo of your electricity bill to get started on finding you a better deal on your utilities.")
     elif "another" in incoming_msg:
-        msg.body("Okay, send me the next bill photo.")
+        msg.body("Okay, if you have another bill, please send me the next photo.")
     elif "done" in incoming_msg:
         msg.body("Thanks! I’ll start comparing your plans now and send your weekly digest.")
     else:
