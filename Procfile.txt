@@ -1,0 +1,1 @@
+web: gunicorn switchbuddy_sandbox:app --workers 2 --threads 4 --timeout 60
