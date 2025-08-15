@@ -1,54 +1,60 @@
+# switchbuddy_sandbox.py
+
+import os
+import time
+import json
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
-import os
 from upstash_redis import Redis
 
-# ---- Upstash via env (no secrets in code) ----
+# -----------------------------
+# Redis (Upstash) client
+# -----------------------------
 UPSTASH_URL = os.environ.get("UPSTASH_URL")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_TOKEN")
 
+# Fail fast if not set
+if not UPSTASH_URL or not UPSTASH_TOKEN:
+    raise RuntimeError("Missing UPSTASH_URL or UPSTASH_TOKEN environment variables.")
+
+# Use `r` for Redis so the rest of the code is consistent
 r = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
 
+# -----------------------------
+# Flask app
+# -----------------------------
 app = Flask(__name__)
 
+# -----------------------------
+# Health & diagnostics
+# -----------------------------
 @app.route("/health", methods=["GET"])
 def health():
     return "ok", 200
 
 @app.route("/redis_diag", methods=["GET"])
 def redis_diag():
-    # Show helpful diagnostics without leaking secrets
-    has_url = bool(UPSTASH_URL)
-    has_token = bool(UPSTASH_TOKEN)
-    url_prefix = None
-    if has_url:
-        # show just the scheme/host prefix for sanity (no creds)
-        # Upstash REST URLs look like "https://<host>.upstash.io"
-        try:
-            url_prefix = UPSTASH_URL.split("://", 1)[0] + "://" + UPSTASH_URL.split("://", 1)[1].split("/", 1)[0]
-        except Exception:
-            url_prefix = "unparsed"
-
     try:
-        ping_ok = r.ping()
+        pong = r.ping()
         return {
-            "has_url": has_url,
-            "has_token": has_token,
-            "url_prefix": url_prefix,
             "connected": True,
-            "ping": ping_ok,
             "error": None,
+            "has_token": bool(UPSTASH_TOKEN),
+            "has_url": bool(UPSTASH_URL),
+            "ping": pong,
+            "url_prefix": (UPSTASH_URL or "")[: UPSTASH_URL.find(".upstash.io")+12] if UPSTASH_URL else ""
         }, 200
     except Exception as e:
         return {
-            "has_url": has_url,
-            "has_token": has_token,
-            "url_prefix": url_prefix,
             "connected": False,
-            "ping": False,
-            "error": str(e),
+            "error": f"{type(e).__name__}: {e}",
+            "has_token": bool(UPSTASH_TOKEN),
+            "has_url": bool(UPSTASH_URL),
         }, 500
 
+# -----------------------------
+# Simple session smoke tests
+# -----------------------------
 @app.route("/set_session", methods=["GET"])
 def set_session():
     r.set("test_key", "Hello from Redis!")
@@ -57,41 +63,59 @@ def set_session():
 @app.route("/get_session", methods=["GET"])
 def get_session():
     value = r.get("test_key")
+    # Upstash returns bytes/str depending on client; be tolerant
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="ignore")
     return f"Value from Redis: {value}", 200
+
+# -----------------------------
+# WhatsApp webhook
+# -----------------------------
+def _normalize_text(s: str) -> str:
+    """Normalize curly quotes, dashes, excess whitespace, and strip punctuation."""
+    if not s:
+        return ""
+    normalized = (
+        s.strip()
+         .replace("\u2019", "'")  # right single quote
+         .replace("\u2018", "'")  # left single quote
+         .replace("\u201C", '"')  # left double quote
+         .replace("\u201D", '"')  # right double quote
+         .replace("\u2013", "-")  # en dash
+         .replace("\u2014", "-")  # em dash
+    )
+    # collapse whitespace, lowercase, strip common trailing punct
+    return " ".join(normalized.split()).lower().strip(" .!?,;:'\"-")
 
 @app.route("/whatsapp/webhook", methods=["POST"])
 def whatsapp_webhook():
-    import json, time
     from_number = (request.values.get("From") or "").replace("whatsapp:", "")
+    raw = (request.values.get("Body") or "")
+    incoming_msg = _normalize_text(raw)
 
-    # --- Normalize incoming text ---
-    raw = (request.values.get("Body") or "").strip()
-    normalized = (
-        raw.replace("\u2019", "'").replace("\u2018", "'")
-           .replace("\u201C", '"').replace("\u201D", '"')
-           .replace("\u2013", "-").replace("\u2014", "-")
-    )
-    incoming_msg = " ".join(normalized.split()).lower().strip(" .!?,;:'\"-")
+    # Per-user keys
+    k_state = f"user:{from_number}:state"        # idle|collecting|done
+    k_count = f"user:{from_number}:bill_count"   # integer
+    k_bills = f"user:{from_number}:bills"        # LIST of JSON entries
 
-    # Keys per user
-    k_state = f"user:{from_number}:state"          # idle|collecting|done
-    k_count = f"user:{from_number}:bill_count"
-    k_bills = f"user:{from_number}:bills"          # Redis LIST of JSON entries
-
-    # Init defaults if missing
+    # Initialize defaults
     if r.get(k_state) is None:
         r.set(k_state, "idle")
     if r.get(k_count) is None:
         r.set(k_count, 0)
 
     state = r.get(k_state)
+    if isinstance(state, bytes):
+        state = state.decode("utf-8", errors="ignore")
     bill_count = int(r.get(k_count) or 0)
 
     resp = MessagingResponse()
     msg = resp.message()
 
-    def said_any(*phrases):
+    def said_any(*phrases) -> bool:
         return any(p in incoming_msg for p in phrases)
+
+    # --- Intents ---
 
     # Start
     if said_any("hi", "hello", "start"):
@@ -117,18 +141,20 @@ def whatsapp_webhook():
         )
         return str(resp)
 
-    # List bills (summary)
+    # List bills
     if said_any("list bills", "show bills", "what have you saved"):
         entries = r.lrange(k_bills, -10, -1) or []
         if not entries:
             msg.body("I haven’t saved any bill files yet. Send a photo/PDF to add one.")
             return str(resp)
+
         lines = []
         start_index = max(1, bill_count - len(entries) + 1)
         for i, e in enumerate(entries, start=start_index):
             try:
                 j = json.loads(e)
-                kind = "PDF" if (j.get("media_type","").lower().endswith("pdf")) else "Image"
+                media_type = (j.get("media_type") or "").lower()
+                kind = "PDF" if media_type.endswith("pdf") or "pdf" in media_type else "Image"
                 ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(j.get("ts", 0)))
                 lines.append(f"#{i}: {kind} @ {ts}")
             except Exception:
@@ -142,9 +168,10 @@ def whatsapp_webhook():
         msg.body("Cool — send the next bill photo/PDF. When finished, say “that's all”.")
         return str(resp)
 
-    # Media handling (save url/type/timestamp)
+    # Media handling (Twilio sends MediaUrl0/MediaContentType0 when files attached)
     media_url = request.values.get("MediaUrl0")
     media_type = request.values.get("MediaContentType0")
+
     if state == "collecting" and media_url:
         entry = {
             "media_url": media_url,
@@ -160,7 +187,7 @@ def whatsapp_webhook():
         )
         return str(resp)
 
-    # Fallbacks
+    # Fallbacks based on state
     if state == "collecting":
         msg.body(
             "I’m ready — please send a photo/PDF of your bill.\n"
@@ -172,22 +199,32 @@ def whatsapp_webhook():
         msg.body("Say 'hi' to get started with your bill upload.")
     return str(resp)
 
+# -----------------------------
+# Admin/testing: list saved bills as JSON
+# -----------------------------
 @app.route("/user_bills", methods=["GET"])
 def user_bills():
-    """Admin helper: GET /user_bills?phone=+61XXXXXXXXX returns JSON of stored bills."""
-    import json
+    """
+    Admin helper:
+      GET /user_bills?phone=+61XXXXXXXXX
+    Returns JSON of saved bill entries for that phone.
+    """
     phone = request.args.get("phone", "").strip()
     if not phone:
         return {"error": "Missing ?phone=+61..."}, 400
     k_bills = f"user:{phone}:bills"
     entries = r.lrange(k_bills, 0, -1) or []
-    try:
-        parsed = [json.loads(e) for e in entries]
-    except Exception:
-        parsed = []
+    parsed = []
+    for e in entries:
+        try:
+            parsed.append(json.loads(e))
+        except Exception:
+            parsed.append({"raw": e})
     return {"phone": phone, "count": len(parsed), "bills": parsed}, 200
 
-
+# -----------------------------
+# Entrypoint
+# -----------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     print(f"Starting SwitchBuddy on http://0.0.0.0:{port}")
