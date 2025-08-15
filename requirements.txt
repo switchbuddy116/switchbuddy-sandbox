@@ -19,7 +19,7 @@ multidict==6.6.4
 packaging==25.0
 propcache==0.3.2
 PyJWT==2.10.1
-redis==5.4.0
+redis==6.4.0
 requests==2.32.4
 twilio==9.7.0
 urllib3==2.5.0
