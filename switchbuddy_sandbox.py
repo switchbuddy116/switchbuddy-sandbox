@@ -14,11 +14,10 @@ from upstash_redis import Redis
 UPSTASH_URL = os.environ.get("UPSTASH_URL")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_TOKEN")
 
-# Fail fast if not set
 if not UPSTASH_URL or not UPSTASH_TOKEN:
     raise RuntimeError("Missing UPSTASH_URL or UPSTASH_TOKEN environment variables.")
 
-# Use `r` for Redis so the rest of the code is consistent
+# Upstash client (simple HTTP-based Redis)
 r = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
 
 # -----------------------------
@@ -43,7 +42,7 @@ def redis_diag():
             "has_token": bool(UPSTASH_TOKEN),
             "has_url": bool(UPSTASH_URL),
             "ping": pong,
-            "url_prefix": (UPSTASH_URL or "")[: UPSTASH_URL.find(".upstash.io")+12] if UPSTASH_URL else ""
+            "url_prefix": (UPSTASH_URL or "")[: (UPSTASH_URL.find(".upstash.io") + 12)] if UPSTASH_URL else ""
         }, 200
     except Exception as e:
         return {
@@ -52,6 +51,7 @@ def redis_diag():
             "has_token": bool(UPSTASH_TOKEN),
             "has_url": bool(UPSTASH_URL),
         }, 500
+
 # -----------------------------
 # Twilio media download helper
 # -----------------------------
@@ -59,24 +59,19 @@ def download_twilio_media(media_url: str, timeout=15):
     """
     Downloads a Twilio-hosted media URL using HTTP Basic Auth.
     Returns (content_bytes, content_type, content_length_int).
-    Raises Exception on failure.
     """
     sid = os.environ.get("TWILIO_ACCOUNT_SID")
     token = os.environ.get("TWILIO_AUTH_TOKEN")
-
     if not sid or not token:
-        raise RuntimeError("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN.")
+        raise RuntimeError("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN env vars.")
 
-    # Twilio media URLs require Basic Auth with Account SID/Auth Token
-    # We stream to avoid huge memory use; for now we cap at ~10MB.
     max_bytes = 10 * 1024 * 1024  # 10 MB soft cap for sandbox
     with requests.get(media_url, auth=(sid, token), stream=True, timeout=timeout) as resp:
         resp.raise_for_status()
         content_type = resp.headers.get("Content-Type", "")
         content_len_header = resp.headers.get("Content-Length")
-        content_length = int(content_len_header) if content_len_header and content_len_header.isdigit() else None
+        content_length = int(content_len_header) if (content_len_header or "").isdigit() else None
 
-        # Read up to max_bytes
         chunks = []
         total = 0
         for chunk in resp.iter_content(chunk_size=8192):
@@ -100,30 +95,28 @@ def set_session():
 @app.route("/get_session", methods=["GET"])
 def get_session():
     value = r.get("test_key")
-    # Upstash returns bytes/str depending on client; be tolerant
     if isinstance(value, bytes):
         value = value.decode("utf-8", errors="ignore")
     return f"Value from Redis: {value}", 200
 
 # -----------------------------
-# WhatsApp webhook
+# Helpers
 # -----------------------------
 def _normalize_text(s: str) -> str:
-    """Normalize curly quotes, dashes, excess whitespace, and strip punctuation."""
+    """Normalize curly quotes, dashes, whitespace, then lowercase + strip punctuation."""
     if not s:
         return ""
     normalized = (
         s.strip()
-         .replace("\u2019", "'")  # right single quote
-         .replace("\u2018", "'")  # left single quote
-         .replace("\u201C", '"')  # left double quote
-         .replace("\u201D", '"')  # right double quote
-         .replace("\u2013", "-")  # en dash
-         .replace("\u2014", "-")  # em dash
+         .replace("\u2019", "'").replace("\u2018", "'")
+         .replace("\u201C", '"').replace("\u201D", '"')
+         .replace("\u2013", "-").replace("\u2014", "-")
     )
-    # collapse whitespace, lowercase, strip common trailing punct
     return " ".join(normalized.split()).lower().strip(" .!?,;:'\"-")
 
+# -----------------------------
+# WhatsApp webhook
+# -----------------------------
 @app.route("/whatsapp/webhook", methods=["POST"])
 def whatsapp_webhook():
     from_number = (request.values.get("From") or "").replace("whatsapp:", "")
@@ -205,57 +198,55 @@ def whatsapp_webhook():
         msg.body("Cool — send the next bill photo/PDF. When finished, say “that's all”.")
         return str(resp)
 
-# Media handling (Twilio sends MediaUrl0/MediaContentType0 when files attached)
-media_url = request.values.get("MediaUrl0")
-media_type = request.values.get("MediaContentType0")
+    # ---- Media handling (must be INSIDE this function) ----
+    media_url = request.values.get("MediaUrl0")
+    media_type = request.values.get("MediaContentType0")
 
-if state == "collecting" and media_url:
-    # Try to fetch the media from Twilio (auth required)
-    downloaded_ok = False
-    size_bytes = None
-    fetched_type = None
-    err = None
-    try:
-        content, fetched_type, size_bytes = download_twilio_media(media_url)
-        downloaded_ok = True
-        # (Sandbox) We’re not storing files yet; just proving we can fetch them.
-        # If you want to keep a tiny sample, you could write to /tmp here.
-        # with open(f"/tmp/bill_{int(time.time())}.bin", "wb") as f:
-        #     f.write(content)
-    except Exception as e:
-        err = f"{type(e).__name__}: {e}"
+    if state == "collecting" and media_url:
+        # Try to fetch the media from Twilio (auth required)
+        downloaded_ok = False
+        size_bytes = None
+        fetched_type = None
+        err = None
+        try:
+            content, fetched_type, size_bytes = download_twilio_media(media_url)
+            downloaded_ok = True
+            # (Sandbox) We’re not storing files yet; just proving we can fetch them.
+            # with open(f"/tmp/bill_{int(time.time())}.bin", "wb") as f:
+            #     f.write(content)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
 
-    entry = {
-        "media_url": media_url,                 # Twilio temp URL (expires eventually)
-        "media_type": media_type or fetched_type or "",
-        "ts": int(time.time()),
-        "downloaded_ok": downloaded_ok,
-        "download_err": err,
-        "download_size_bytes": size_bytes
-    }
-    r.rpush(k_bills, json.dumps(entry))
-    new_count = bill_count + 1
-    r.set(k_count, new_count)
+        entry = {
+            "media_url": media_url,                 # Twilio temp URL
+            "media_type": media_type or fetched_type or "",
+            "ts": int(time.time()),
+            "downloaded_ok": downloaded_ok,
+            "download_err": err,
+            "download_size_bytes": size_bytes
+        }
+        r.rpush(k_bills, json.dumps(entry))
+        new_count = bill_count + 1
+        r.set(k_count, new_count)
 
-    if downloaded_ok:
-        human_size = f"{size_bytes/1024:.1f} KB" if size_bytes and size_bytes < 1024*1024 else (
-            f"{size_bytes/1024/1024:.2f} MB" if size_bytes else "unknown size"
-        )
-        msg.body(
-            f"Bill received ✅ (#{new_count}).\n"
-            f"(Fetched media: {human_size})\n\n"
-            "Reply 'add another bill' to add more, 'list bills' to review, or 'that's all' to finish."
-        )
-    else:
-        msg.body(
-            f"Bill received ✅ (#{new_count}).\n"
-            "Heads up: I couldn’t fetch the file from Twilio just now, but the link was saved. "
-            "You can try sending it again, or proceed.\n\n"
-            "Reply 'add another bill' to add more, 'list bills' to review, or 'that's all' to finish."
-        )
-    return str(resp)
-
-
+        if downloaded_ok:
+            if size_bytes:
+                human_size = f"{size_bytes/1024:.1f} KB" if size_bytes < 1024*1024 else f"{size_bytes/1024/1024:.2f} MB"
+            else:
+                human_size = "unknown size"
+            msg.body(
+                f"Bill received ✅ (#{new_count}).\n"
+                f"(Fetched media: {human_size})\n\n"
+                "Reply 'add another bill' to add more, 'list bills' to review, or 'that's all' to finish."
+            )
+        else:
+            msg.body(
+                f"Bill received ✅ (#{new_count}).\n"
+                "Heads up: I couldn’t fetch the file from Twilio just now, but the link was saved. "
+                "You can try sending it again, or proceed.\n\n"
+                "Reply 'add another bill' to add more, 'list bills' to review, or 'that's all' to finish."
+            )
+        return str(resp)
 
     # Fallbacks based on state
     if state == "collecting":
@@ -291,6 +282,7 @@ def user_bills():
         except Exception:
             parsed.append({"raw": e})
     return {"phone": phone, "count": len(parsed), "bills": parsed}, 200
+
 @app.route("/last_bill", methods=["GET"])
 def last_bill():
     """Quick debug: /last_bill?phone=+61XXXXXXXXX -> shows last saved bill entry."""
