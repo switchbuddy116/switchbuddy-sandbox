@@ -509,16 +509,18 @@ def whatsapp_webhook():
     media_url = request.values.get("MediaUrl0")
     media_type = request.values.get("MediaContentType0")
 
-    if state == "collecting" and media_url:
+       if state == "collecting" and media_url:
         # Try to fetch the media from Twilio (auth required)
         downloaded_ok = False
         size_bytes = None
         fetched_type = None
         err = None
+        parsed = None
         try:
             content, fetched_type, size_bytes = download_twilio_media(media_url)
             downloaded_ok = True
-            # (Sandbox) Not storing the actual file yet.
+            # Parse the bill content into a structured profile (stub for now)
+            parsed = parse_bill_bytes(content, fetched_type or (media_type or ""))
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
 
@@ -528,8 +530,11 @@ def whatsapp_webhook():
             "ts": int(time.time()),
             "downloaded_ok": downloaded_ok,
             "download_err": err,
-            "download_size_bytes": size_bytes
+            "download_size_bytes": size_bytes,
         }
+        if parsed:
+            entry["parsed"] = parsed
+
         r.rpush(k_bills, json.dumps(entry))
         new_count = bill_count + 1
         r.set(k_count, new_count)
