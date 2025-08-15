@@ -9,9 +9,13 @@ REDIS_URL = os.environ.get("REDIS_URL", "")
 r = None
 if REDIS_URL and (REDIS_URL.startswith("redis://") or REDIS_URL.startswith("rediss://")):
     try:
-        r = redis.from_url(REDIS_URL, decode_responses=True, ssl=REDIS_URL.startswith("rediss://"))
+        # Do NOT pass ssl=... — rediss:// enables TLS automatically
+        r = redis.from_url(REDIS_URL, decode_responses=True)
+        # optional: quick ping to verify connectivity
+        r.ping()
     except Exception:
         r = None
+
 
 def _default_session():
     return {"state": "NEW", "bills": [], "updated_at": time.time()}
