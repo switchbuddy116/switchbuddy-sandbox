@@ -194,7 +194,7 @@ def whatsapp_webhook():
     k_count = f"user:{from_number}:bill_count"   # integer
     k_bills = f"user:{from_number}:bills"        # LIST of JSON entries
 
-    # Initialize defaults
+    # Init defaults
     if r.get(k_state) is None:
         r.set(k_state, "idle")
     if r.get(k_count) is None:
@@ -218,11 +218,11 @@ def whatsapp_webhook():
         r.set(k_state, "collecting")
         msg.body(
             "Hi! I’m SwitchBuddy ⚡️\n\n"
-            "Please send a photo or PDF of your electricity bill.\n\n"
-            "When you’re finished:\n"
-            "• Reply: 'add another bill' to upload more\n"
-            "• Reply: 'that's all' to finish\n"
-            "• Reply: 'list bills' to see what I’ve saved"
+            "Send a photo or PDF of your bill.\n\n"
+            "• 'add another bill' to upload more\n"
+            "• 'that's all' to finish\n"
+            "• 'list bills' to see saved files\n"
+            "• 'digest' to get your weekly summary"
         )
         return str(resp)
 
@@ -233,7 +233,7 @@ def whatsapp_webhook():
         msg.body(
             f"All set! I’ve saved {count} bill(s).\n"
             "I’ll crunch the numbers and include them in your weekly digest. "
-            "If you want to add more later, just say 'hi'."
+            "You can say 'digest' any time to preview it."
         )
         return str(resp)
 
@@ -258,18 +258,46 @@ def whatsapp_webhook():
         msg.body("Recent saved bills:\n" + "\n".join(lines))
         return str(resp)
 
+    # Digest (summary link + quick facts)
+    if said_any("digest", "summary"):
+        entries = r.lrange(k_bills, 0, -1) or []
+        count = len(entries)
+        last = entries[-1] if entries else None
+        last_type = last_ts = last_size = last_fetched = None
+        if last:
+            try:
+                j = json.loads(last)
+                last_type = j.get("media_type") or ""
+                last_ts = j.get("ts")
+                last_size = j.get("download_size_bytes")
+                last_fetched = j.get("downloaded_ok")
+            except Exception:
+                pass
+
+        # %2B-encode the plus sign
+        phone_param = f"%2B{from_number}" if from_number.startswith("+") else f"%2B{from_number}"
+        preview_url = f"https://{request.host}/digest_preview?phone={phone_param}"
+
+        facts = [
+            f"Total bills saved: {count}",
+            f"Last bill type: {last_type or 'n/a'}",
+            f"Fetched from Twilio: {'yes' if last_fetched else 'no' if last_fetched is not None else 'n/a'}",
+            f"Last file size: {f'{last_size/1024:.0f} KB' if isinstance(last_size, int) else 'n/a'}",
+        ]
+        msg.body("Weekly Digest (preview)\n" + "\n".join(f"• {x}" for x in facts) + f"\n\n{preview_url}")
+        return str(resp)
+
     # Add another
     if said_any("add another bill", "add another", "another bill", "add more", "upload another"):
         r.set(k_state, "collecting")
         msg.body("Cool — send the next bill photo/PDF. When finished, say “that's all”.")
         return str(resp)
 
-    # ---- Media handling (must be INSIDE this function) ----
+    # --- Media handling ---
     media_url = request.values.get("MediaUrl0")
     media_type = request.values.get("MediaContentType0")
 
     if state == "collecting" and media_url:
-        # Try to fetch the media from Twilio (auth required)
         downloaded_ok = False
         size_bytes = None
         fetched_type = None
@@ -277,14 +305,11 @@ def whatsapp_webhook():
         try:
             content, fetched_type, size_bytes = download_twilio_media(media_url)
             downloaded_ok = True
-            # (Sandbox) We’re not storing files yet; just proving we can fetch them.
-            # with open(f"/tmp/bill_{int(time.time())}.bin", "wb") as f:
-            #     f.write(content)
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
 
         entry = {
-            "media_url": media_url,                 # Twilio temp URL
+            "media_url": media_url,
             "media_type": media_type or fetched_type or "",
             "ts": int(time.time()),
             "downloaded_ok": downloaded_ok,
@@ -296,10 +321,10 @@ def whatsapp_webhook():
         r.set(k_count, new_count)
 
         if downloaded_ok:
-            if size_bytes:
-                human_size = f"{size_bytes/1024:.1f} KB" if size_bytes < 1024*1024 else f"{size_bytes/1024/1024:.2f} MB"
-            else:
-                human_size = "unknown size"
+            human_size = (
+                f"{size_bytes/1024:.1f} KB" if size_bytes and size_bytes < 1024*1024
+                else (f"{size_bytes/1024/1024:.2f} MB" if size_bytes else "unknown size")
+            )
             msg.body(
                 f"Bill received ✅ (#{new_count}).\n"
                 f"(Fetched media: {human_size})\n\n"
@@ -314,14 +339,11 @@ def whatsapp_webhook():
             )
         return str(resp)
 
-    # Fallbacks based on state
+    # Fallbacks
     if state == "collecting":
-        msg.body(
-            "I’m ready — please send a photo/PDF of your bill.\n"
-            "Or say 'that's all' when you’re finished."
-        )
+        msg.body("I’m ready — send a photo/PDF of your bill, or say 'that's all' when finished.")
     elif state == "done":
-        msg.body("You’re done for now 🎉 Say 'hi' if you want to add more bills.")
+        msg.body("You’re done for now 🎉 Say 'hi' if you want to add more bills, or 'digest' for a summary.")
     else:
         msg.body("Say 'hi' to get started with your bill upload.")
     return str(resp)
