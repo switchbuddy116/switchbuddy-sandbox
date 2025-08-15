@@ -32,6 +32,29 @@ app = Flask(__name__)
 # -----------------------------
 # Helpers
 # -----------------------------
+
+# ---- Bill parsing (stub using OCR/API later) ----
+def parse_bill_bytes(content: bytes, content_type: str) -> dict:
+    """
+    TODO: Replace with real OCR/API.
+    For now, return a plausible structure so compare works end-to-end.
+    """
+    # Demo defaults
+    return {
+        "period_start": "2025-06-01",
+        "period_end": "2025-08-01",
+        "total_kwh": 1200,             # 2 months worth (example)
+        "daily_kwh": round(1200 / 62, 2),
+        "supply_cents_per_day": 110,   # $1.10/day
+        "usage_cents_per_kwh_peak": 40,
+        "usage_cents_per_kwh_shoulder": 28,
+        "usage_cents_per_kwh_offpeak": 22,
+        "tariff_type": "TOU",
+        "distributor": "CitiPower",    # example
+        "total_cost_inc_gst": 540.00
+    }
+
+
 def e164(raw: str) -> str:
     """
     Normalize a phone for Redis keys:
@@ -175,6 +198,141 @@ def _build_digest_html(phone: str) -> str:
 </html>
 """
     return html
+
+# ---- Tariff fetcher (stub) ----
+def fetch_tariffs_vic():
+    """
+    TODO: Swap with live data later (VIC source).
+    Return a few sample plans to compare against.
+    All cents values include GST for simplicity.
+    """
+    return [
+        {
+            "name": "Flat Saver",
+            "tariff_type": "FLAT",
+            "supply_cents_per_day": 105,
+            "usage_cents_per_kwh": 32
+        },
+        {
+            "name": "TOU Value",
+            "tariff_type": "TOU",
+            "supply_cents_per_day": 95,
+            "peak_cents": 42,
+            "shoulder_cents": 28,
+            "offpeak_cents": 20
+        },
+        {
+            "name": "Daily Low",
+            "tariff_type": "FLAT",
+            "supply_cents_per_day": 80,
+            "usage_cents_per_kwh": 36
+        }
+    ]
+
+
+def estimate_annual_cost(profile: dict, plan: dict) -> float:
+    """
+    Very rough estimate. Improve once we parse TOU shares from bills.
+    """
+    # Infer annual kWh from bill period if total_kwh provided
+    total_kwh = float(profile.get("total_kwh") or 0)
+    start = profile.get("period_start")
+    end = profile.get("period_end")
+
+    # Default to 365 days and scale up
+    days = 62  # if we can’t parse exact days, assume 2 months
+    try:
+        from datetime import datetime
+        if start and end:
+            ds = datetime.fromisoformat(start)
+            de = datetime.fromisoformat(end)
+            days = max((de - ds).days, 1)
+    except Exception:
+        pass
+
+    daily_kwh = profile.get("daily_kwh")
+    if daily_kwh is None and total_kwh:
+        daily_kwh = total_kwh / days
+    if daily_kwh is None:
+        daily_kwh = 10  # fallback guess
+
+    annual_kwh = daily_kwh * 365
+
+    # Supply charge
+    supply_cents = float(plan.get("supply_cents_per_day") or 0) * 365
+
+    if plan.get("tariff_type") == "FLAT":
+        usage_cents = annual_kwh * float(plan.get("usage_cents_per_kwh") or 0)
+    else:
+        # crude split until we have real TOU breakdowns
+        peak = 0.5 * annual_kwh
+        shoulder = 0.3 * annual_kwh
+        offpeak = 0.2 * annual_kwh
+        usage_cents = (
+            peak * float(plan.get("peak_cents") or 0) +
+            shoulder * float(plan.get("shoulder_cents") or 0) +
+            offpeak * float(plan.get("offpeak_cents") or 0)
+        )
+
+    total_cents = supply_cents + usage_cents
+    return round(total_cents / 100.0, 2)  # dollars
+
+
+def compare_and_store(phone: str) -> dict:
+    """
+    Load the user’s latest parsed bill (or aggregate of bills),
+    compute best plan, store a snapshot, and return it.
+    """
+    k_bills = f"user:{phone}:bills"
+    raw_entries = r.lrange(k_bills, 0, -1) or []
+
+    # Use the last bill that has a parsed profile if present; otherwise synthesize a basic profile
+    latest_profile = None
+    for raw in reversed(raw_entries):
+        try:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="ignore")
+            j = json.loads(raw)
+            if j.get("parsed"):
+                latest_profile = j["parsed"]
+                break
+        except Exception:
+            pass
+
+    if not latest_profile:
+        # Fallback profile so the pipeline runs (replace once parsing is in)
+        latest_profile = {
+            "total_kwh": 1200,
+            "period_start": "2025-06-01",
+            "period_end": "2025-08-01",
+            "daily_kwh": round(1200/62, 2),
+        }
+
+    plans = fetch_tariffs_vic()
+    scored = []
+    for p in plans:
+        cost = estimate_annual_cost(latest_profile, p)
+        scored.append({"plan": p, "annual_cost": cost})
+    scored.sort(key=lambda x: x["annual_cost"])
+
+    best = scored[0]
+    worst = scored[-1]
+    # “Current” cost guess: use worst or flat mid—here we’ll use the median as a softer baseline
+    median_cost = scored[len(scored)//2]["annual_cost"]
+    savings = round(median_cost - best["annual_cost"], 2)
+
+    snapshot = {
+        "ts": int(time.time()),
+        "profile": latest_profile,
+        "ranked": scored,
+        "best": best,
+        "baseline_cost": median_cost,
+        "projected_savings": savings
+    }
+
+    r.set(f"user:{phone}:last_comparison", json.dumps(snapshot))
+    return snapshot
+
 
 # -----------------------------
 # Health & diagnostics
@@ -416,6 +574,47 @@ def whatsapp_webhook():
     else:
         msg.body("Say 'hi' to get started with your bill upload.")
     return str(resp)
+
+# After content, fetched_type, size_bytes = download_twilio_media(...)
+parsed = parse_bill_bytes(content, fetched_type or (media_type or ""))
+
+entry = {
+    "media_url": media_url,
+    "media_type": media_type or fetched_type or "",
+    "ts": int(time.time()),
+    "downloaded_ok": True,
+    "download_err": None,
+    "download_size_bytes": size_bytes,
+    "parsed": parsed,  # <--- store the structured result
+}
+r.rpush(k_bills, json.dumps(entry))
+
+if said_any("that's all", "thats all", "done", "finish", "finished", "all done"):
+    r.set(k_state, "done")
+    count = int(r.get(k_count) or 0)
+    cmp = compare_and_store(phone)
+    savings = cmp.get("projected_savings", 0.0)
+    msg.body(
+        f"All set! I’ve saved {count} bill(s).\n"
+        f"Projected annual savings right now: ${savings:,.0f}.\n"
+        "I’ll include this in your weekly digest. Say 'digest' to preview."
+    )
+    return str(resp)
+
+snap_raw = r.get(f"user:{phone}:last_comparison")
+if snap_raw:
+    try:
+        if isinstance(snap_raw, bytes):
+            snap_raw = snap_raw.decode("utf-8", errors="ignore")
+        snap = json.loads(snap_raw)
+        best_name = snap["best"]["plan"]["name"]
+        best_cost = snap["best"]["annual_cost"]
+        savings = snap["projected_savings"]
+        # add a small “Best plan” panel into your existing HTML
+        # (you can weave this into your template where you like)
+    except Exception:
+        pass
+
 
 # -----------------------------
 # Admin/testing: list & last bill
