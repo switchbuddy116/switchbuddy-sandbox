@@ -1,30 +1,11 @@
 # switchbuddy_sandbox.py
 
 import os
+import re
 import time
 import json
 import requests
-import re
-
-def e164(raw: str) -> str:
-    """
-    Normalize a phone to E.164-ish for our Redis keys.
-    - strips 'whatsapp:' prefix
-    - keeps digits and leading '+'
-    - if no leading '+', add it
-    """
-    if not raw:
-        return ""
-    s = raw.strip().replace("whatsapp:", "")
-    # keep digits and '+' only; collapse spaces etc.
-    s = "".join(ch for ch in s if ch.isdigit() or ch == "+")
-    if not s:
-        return ""
-    if s[0] != "+":
-        s = "+" + s
-    return s
-
-from flask import Flask, request, Markup
+from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from upstash_redis import Redis
 
@@ -33,11 +14,76 @@ from upstash_redis import Redis
 # -----------------------------
 UPSTASH_URL = os.environ.get("UPSTASH_URL")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_TOKEN")
-
 if not UPSTASH_URL or not UPSTASH_TOKEN:
     raise RuntimeError("Missing UPSTASH_URL or UPSTASH_TOKEN environment variables.")
 
+# Use `r` consistently
 r = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def e164(raw: str) -> str:
+    """
+    Normalize a phone for Redis keys:
+    - strips 'whatsapp:' prefix
+    - keeps digits and leading '+'
+    - adds '+' if missing
+    """
+    if not raw:
+        return ""
+    s = raw.strip().replace("whatsapp:", "")
+    s = "".join(ch for ch in s if ch.isdigit() or ch == "+")
+    if not s:
+        return ""
+    if s[0] != "+":
+        s = "+" + s
+    return s
+
+def _normalize_text(s: str) -> str:
+    """Normalize curly quotes, dashes, excess whitespace, and strip punctuation."""
+    if not s:
+        return ""
+    normalized = (
+        s.strip()
+         .replace("\u2019", "'")
+         .replace("\u2018", "'")
+         .replace("\u201C", '"')
+         .replace("\u201D", '"')
+         .replace("\u2013", "-")
+         .replace("\u2014", "-")
+    )
+    return " ".join(normalized.split()).lower().strip(" .!?,;:'\"-")
+
+def download_twilio_media(media_url: str, timeout=15):
+    """
+    Downloads a Twilio-hosted media URL using HTTP Basic Auth.
+    Returns (content_bytes, content_type, content_length_int).
+    Raises Exception on failure.
+    """
+    sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    token = os.environ.get("TWILIO_AUTH_TOKEN")
+    if not sid or not token:
+        raise RuntimeError("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN.")
+
+    max_bytes = 10 * 1024 * 1024  # 10 MB cap for sandbox
+    with requests.get(media_url, auth=(sid, token), stream=True, timeout=timeout) as resp:
+        resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "")
+        content_len_header = resp.headers.get("Content-Length")
+        content_length = int(content_len_header) if content_len_header and content_len_header.isdigit() else None
+
+        chunks = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(f"Media exceeds {max_bytes} bytes limit for sandbox.")
+        content = b"".join(chunks)
+
+    return content, content_type, (content_length if content_length is not None else len(content))
 
 # -----------------------------
 # Flask app
@@ -55,16 +101,13 @@ def health():
 def redis_diag():
     try:
         pong = r.ping()
-        pref = ""
-        if UPSTASH_URL and ".upstash.io" in UPSTASH_URL:
-            pref = UPSTASH_URL[: UPSTASH_URL.find(".upstash.io") + len(".upstash.io")]
         return {
             "connected": True,
             "error": None,
             "has_token": bool(UPSTASH_TOKEN),
             "has_url": bool(UPSTASH_URL),
             "ping": pong,
-            "url_prefix": pref
+            "url_prefix": (UPSTASH_URL or "")[: (UPSTASH_URL.find(".upstash.io") + 12)] if UPSTASH_URL else ""
         }, 200
     except Exception as e:
         return {
@@ -73,38 +116,6 @@ def redis_diag():
             "has_token": bool(UPSTASH_TOKEN),
             "has_url": bool(UPSTASH_URL),
         }, 500
-
-# -----------------------------
-# Twilio media download helper
-# -----------------------------
-def download_twilio_media(media_url: str, timeout=15):
-    """
-    Downloads a Twilio-hosted media URL using HTTP Basic Auth.
-    Returns (content_bytes, content_type, content_length_int).
-    Raises Exception on failure.
-    """
-    sid = os.environ.get("TWILIO_ACCOUNT_SID")
-    token = os.environ.get("TWILIO_AUTH_TOKEN")
-    if not sid or not token:
-        raise RuntimeError("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN.")
-
-    max_bytes = 10 * 1024 * 1024  # 10 MB soft cap for sandbox
-    with requests.get(media_url, auth=(sid, token), stream=True, timeout=timeout) as resp:
-        resp.raise_for_status()
-        content_type = resp.headers.get("Content-Type", "")
-        content_len_header = resp.headers.get("Content-Length")
-        content_length = int(content_len_header) if content_len_header and content_len_header.isdigit() else None
-
-        chunks, total = [], 0
-        for chunk in resp.iter_content(chunk_size=8192):
-            if chunk:
-                chunks.append(chunk)
-                total += len(chunk)
-                if total > max_bytes:
-                    raise ValueError(f"Media exceeds {max_bytes} bytes limit for sandbox.")
-        content = b"".join(chunks)
-
-    return content, content_type, (content_length if content_length is not None else len(content))
 
 # -----------------------------
 # Simple session smoke tests
@@ -122,34 +133,22 @@ def get_session():
     return f"Value from Redis: {value}", 200
 
 # -----------------------------
-# Helper: normalize user text
-# -----------------------------
-def _normalize_text(s: str) -> str:
-    if not s:
-        return ""
-    normalized = (
-        s.strip()
-         .replace("\u2019", "'").replace("\u2018", "'")
-         .replace("\u201C", '"').replace("\u201D", '"')
-         .replace("\u2013", "-").replace("\u2014", "-")
-    )
-    return " ".join(normalized.split()).lower().strip(" .!?,;:'\"-")
-
-# -----------------------------
 # WhatsApp webhook
 # -----------------------------
 @app.route("/whatsapp/webhook", methods=["POST"])
 def whatsapp_webhook():
-  
-from_number_raw = request.values.get("From") or ""
-phone = e164(from_number_raw)
+    from_number_raw = request.values.get("From") or ""
+    phone = e164(from_number_raw)
 
-k_state = f"user:{phone}:state"
-k_count = f"user:{phone}:bill_count"
-k_bills = f"user:{phone}:bills"
+    raw = (request.values.get("Body") or "")
+    incoming_msg = _normalize_text(raw)
 
+    # Per-user keys
+    k_state = f"user:{phone}:state"        # idle|collecting|done
+    k_count = f"user:{phone}:bill_count"   # integer
+    k_bills = f"user:{phone}:bills"        # LIST of JSON entries
 
-    # Init defaults
+    # Initialize defaults
     if r.get(k_state) is None:
         r.set(k_state, "idle")
     if r.get(k_count) is None:
@@ -173,11 +172,11 @@ k_bills = f"user:{phone}:bills"
         r.set(k_state, "collecting")
         msg.body(
             "Hi! I’m SwitchBuddy ⚡️\n\n"
-            "Send a photo or PDF of your bill.\n\n"
-            "• 'add another bill' to upload more\n"
-            "• 'that's all' to finish\n"
-            "• 'list bills' to see saved files\n"
-            "• 'digest' to get your weekly summary"
+            "Please send a photo or PDF of your electricity bill.\n\n"
+            "When you’re finished:\n"
+            "• Reply: 'add another bill' to upload more\n"
+            "• Reply: 'that's all' to finish\n"
+            "• Reply: 'list bills' to see what I’ve saved"
         )
         return str(resp)
 
@@ -188,7 +187,7 @@ k_bills = f"user:{phone}:bills"
         msg.body(
             f"All set! I’ve saved {count} bill(s).\n"
             "I’ll crunch the numbers and include them in your weekly digest. "
-            "You can say 'digest' any time to preview it."
+            "If you want to add more later, just say 'hi'."
         )
         return str(resp)
 
@@ -203,6 +202,8 @@ k_bills = f"user:{phone}:bills"
         start_index = max(1, bill_count - len(entries) + 1)
         for i, e in enumerate(entries, start=start_index):
             try:
+                if isinstance(e, bytes):
+                    e = e.decode("utf-8", errors="ignore")
                 j = json.loads(e)
                 media_type = (j.get("media_type") or "").lower()
                 kind = "PDF" if media_type.endswith("pdf") or "pdf" in media_type else "Image"
@@ -213,47 +214,18 @@ k_bills = f"user:{phone}:bills"
         msg.body("Recent saved bills:\n" + "\n".join(lines))
         return str(resp)
 
-    # Digest (summary link + quick facts)
-    if said_any("digest", "summary"):
-        entries = r.lrange(k_bills, 0, -1) or []
-        count = len(entries)
-        last = entries[-1] if entries else None
-        last_type = last_ts = last_size = last_fetched = None
-        if last:
-            try:
-                j = json.loads(last)
-                last_type = j.get("media_type") or ""
-                last_ts = j.get("ts")
-                last_size = j.get("download_size_bytes")
-                last_fetched = j.get("downloaded_ok")
-            except Exception:
-                pass
-
-        phone_num = from_number.lstrip("+")
-        phone_param = f"%2B{phone_num}"
-        preview_url = f"https://{request.host}/digest_preview?phone={phone_param}"
-
-        facts = [
-            f"Total bills saved: {count}",
-            f"Last bill uploaded: {time.strftime('%Y-%m-%d %H:%M', time.localtime(last_ts)) if last_ts else 'n/a'}",
-            f"Last bill type: {last_type or 'n/a'}",
-            f"Fetched from Twilio: {'yes' if last_fetched else 'no' if last_fetched is not None else 'n/a'}",
-            f"Last file size: {f'{last_size/1024:.0f} KB' if isinstance(last_size, int) else 'n/a'}",
-        ]
-        msg.body("Weekly Digest (preview)\n" + "\n".join(f"• {x}" for x in facts) + f"\n\n{preview_url}")
-        return str(resp)
-
     # Add another
     if said_any("add another bill", "add another", "another bill", "add more", "upload another"):
         r.set(k_state, "collecting")
         msg.body("Cool — send the next bill photo/PDF. When finished, say “that's all”.")
         return str(resp)
 
-    # --- Media handling ---
+    # Media handling (Twilio sends MediaUrl0/MediaContentType0 when files attached)
     media_url = request.values.get("MediaUrl0")
     media_type = request.values.get("MediaContentType0")
 
     if state == "collecting" and media_url:
+        # Try to fetch the media from Twilio (auth required)
         downloaded_ok = False
         size_bytes = None
         fetched_type = None
@@ -261,12 +233,12 @@ k_bills = f"user:{phone}:bills"
         try:
             content, fetched_type, size_bytes = download_twilio_media(media_url)
             downloaded_ok = True
-            # (Not persisting the file yet in sandbox)
+            # (Sandbox) Not storing the actual file yet.
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
 
         entry = {
-            "media_url": media_url,
+            "media_url": media_url,                 # Twilio temp URL (expires)
             "media_type": media_type or fetched_type or "",
             "ts": int(time.time()),
             "downloaded_ok": downloaded_ok,
@@ -278,10 +250,15 @@ k_bills = f"user:{phone}:bills"
         r.set(k_count, new_count)
 
         if downloaded_ok:
-            human_size = (
-                f"{size_bytes/1024:.1f} KB" if size_bytes and size_bytes < 1024*1024
-                else (f"{size_bytes/1024/1024:.2f} MB" if size_bytes else "unknown size")
-            )
+            if size_bytes is None:
+                human_size = "unknown size"
+            elif size_bytes < 1024:
+                human_size = f"{size_bytes} B"
+            elif size_bytes < 1024 * 1024:
+                human_size = f"{size_bytes/1024:.1f} KB"
+            else:
+                human_size = f"{size_bytes/1024/1024:.2f} MB"
+
             msg.body(
                 f"Bill received ✅ (#{new_count}).\n"
                 f"(Fetched media: {human_size})\n\n"
@@ -296,17 +273,62 @@ k_bills = f"user:{phone}:bills"
             )
         return str(resp)
 
-    # Fallbacks
+    # Fallbacks based on state
     if state == "collecting":
-        msg.body("I’m ready — send a photo/PDF of your bill, or say 'that's all' when finished.")
+        msg.body(
+            "I’m ready — please send a photo/PDF of your bill.\n"
+            "Or say 'that's all' when you’re finished."
+        )
     elif state == "done":
-        msg.body("You’re done for now 🎉 Say 'hi' if you want to add more bills, or 'digest' for a summary.")
+        msg.body("You’re done for now 🎉 Say 'hi' if you want to add more bills.")
     else:
         msg.body("Say 'hi' to get started with your bill upload.")
     return str(resp)
 
 # -----------------------------
-# Digest preview page (HTML)
+# Admin/testing: list & last bill
+# -----------------------------
+@app.route("/user_bills", methods=["GET"])
+def user_bills():
+    """
+    Admin helper:
+      GET /user_bills?phone=%2B61XXXXXXXXX
+    Returns JSON of saved bill entries for that phone.
+    """
+    phone = e164(request.args.get("phone", ""))
+    if not phone:
+        return {"error": "Missing ?phone=E164 (encode + as %2B)"}, 400
+    k_bills = f"user:{phone}:bills"
+    entries = r.lrange(k_bills, 0, -1) or []
+    parsed = []
+    for e in entries:
+        try:
+            if isinstance(e, bytes):
+                e = e.decode("utf-8", errors="ignore")
+            parsed.append(json.loads(e))
+        except Exception:
+            parsed.append({"raw": str(e)})
+    return {"phone": phone, "count": len(parsed), "bills": parsed}, 200
+
+@app.route("/last_bill", methods=["GET"])
+def last_bill():
+    """Quick debug: /last_bill?phone=%2B61XXXXXXXXX -> shows last saved bill entry."""
+    phone = e164(request.args.get("phone", ""))
+    if not phone:
+        return {"error": "Missing ?phone=E164 (encode + as %2B)"}, 400
+    k_bills = f"user:{phone}:bills"
+    last = r.lindex(k_bills, -1)
+    if not last:
+        return {"phone": phone, "last_bill": None}, 200
+    try:
+        if isinstance(last, bytes):
+            last = last.decode("utf-8", errors="ignore")
+        return {"phone": phone, "last_bill": json.loads(last)}, 200
+    except Exception:
+        return {"phone": phone, "last_bill": {"raw": str(last)}}, 200
+
+# -----------------------------
+# Weekly digest preview (HTML)
 # -----------------------------
 @app.route("/digest_preview", methods=["GET"])
 def digest_preview():
@@ -318,7 +340,6 @@ def digest_preview():
     k_count = f"user:{phone}:bill_count"
     k_bills = f"user:{phone}:bills"
 
-    # Load entries and parse JSON safely
     raw_entries = r.lrange(k_bills, 0, -1) or []
     entries = []
     for e in raw_entries:
@@ -331,13 +352,11 @@ def digest_preview():
 
     saved_count = len(entries)
     if saved_count == 0:
-        # fall back to the counter if list is empty
         try:
             saved_count = int(r.get(k_count) or 0)
         except Exception:
             saved_count = 0
 
-    # Build simple HTML digest
     def fmt_size(b):
         if not b:
             return "—"
@@ -412,39 +431,7 @@ def digest_preview():
     return html, 200
 
 # -----------------------------
-# Admin/testing helpers
-# -----------------------------
-@app.route("/user_bills", methods=["GET"])
-def user_bills():
-    phone = request.args.get("phone", "").strip()
-    if not phone:
-        return {"error": "Missing ?phone=+61..."}, 400
-    k_bills = f"user:{phone}:bills"
-    entries = r.lrange(k_bills, 0, -1) or []
-    parsed = []
-    for e in entries:
-        try:
-            parsed.append(json.loads(e))
-        except Exception:
-            parsed.append({"raw": e})
-    return {"phone": phone, "count": len(parsed), "bills": parsed}, 200
-
-@app.route("/last_bill", methods=["GET"])
-def last_bill():
-    phone = request.args.get("phone", "").strip()
-    if not phone:
-        return {"error": "Missing ?phone=+61..."}, 400
-    k_bills = f"user:{phone}:bills"
-    last = r.lindex(k_bills, -1)
-    if not last:
-        return {"phone": phone, "last_bill": None}, 200
-    try:
-        return {"phone": phone, "last_bill": json.loads(last)}, 200
-    except Exception:
-        return {"phone": phone, "last_bill": {"raw": last}}, 200
-
-# -----------------------------
-# Entrypoint
+# Entrypoint (local dev)
 # -----------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
