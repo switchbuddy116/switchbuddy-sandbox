@@ -119,14 +119,13 @@ def whatsapp_webhook():
 
     # List bills (summary)
     if said_any("list bills", "show bills", "what have you saved"):
-        # fetch up to last 10 to keep the reply short
         entries = r.lrange(k_bills, -10, -1) or []
         if not entries:
             msg.body("I haven’t saved any bill files yet. Send a photo/PDF to add one.")
             return str(resp)
-        # Format a compact summary
         lines = []
-        for i, e in enumerate(entries, start=max(1, bill_count - len(entries) + 1)):
+        start_index = max(1, bill_count - len(entries) + 1)
+        for i, e in enumerate(entries, start=start_index):
             try:
                 j = json.loads(e)
                 kind = "PDF" if (j.get("media_type","").lower().endswith("pdf")) else "Image"
@@ -172,7 +171,6 @@ def whatsapp_webhook():
     else:
         msg.body("Say 'hi' to get started with your bill upload.")
     return str(resp)
-
 
 @app.route("/user_bills", methods=["GET"])
 def user_bills():
