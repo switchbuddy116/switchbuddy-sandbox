@@ -61,25 +61,22 @@ def get_session():
 
 @app.route("/whatsapp/webhook", methods=["POST"])
 def whatsapp_webhook():
+    import json, time
     from_number = (request.values.get("From") or "").replace("whatsapp:", "")
 
     # --- Normalize incoming text ---
     raw = (request.values.get("Body") or "").strip()
-    # unify common unicode punctuation/whitespace to ASCII
     normalized = (
-        raw.replace("\u2019", "'")   # curly apostrophe -> '
-           .replace("\u2018", "'")   # left single quote -> '
-           .replace("\u201C", '"')   # left double quote -> "
-           .replace("\u201D", '"')   # right double quote -> "
-           .replace("\u2013", "-")   # en dash -> -
-           .replace("\u2014", "-")   # em dash -> -
+        raw.replace("\u2019", "'").replace("\u2018", "'")
+           .replace("\u201C", '"').replace("\u201D", '"')
+           .replace("\u2013", "-").replace("\u2014", "-")
     )
-    # collapse internal whitespace and lowercase
     incoming_msg = " ".join(normalized.split()).lower().strip(" .!?,;:'\"-")
 
     # Keys per user
-    k_state = f"user:{from_number}:state"     # idle|collecting|done
+    k_state = f"user:{from_number}:state"          # idle|collecting|done
     k_count = f"user:{from_number}:bill_count"
+    k_bills = f"user:{from_number}:bills"          # Redis LIST of JSON entries
 
     # Init defaults if missing
     if r.get(k_state) is None:
@@ -93,11 +90,10 @@ def whatsapp_webhook():
     resp = MessagingResponse()
     msg = resp.message()
 
-    # Helpers for intent checks
     def said_any(*phrases):
         return any(p in incoming_msg for p in phrases)
 
-    # --- Intents ---
+    # Start
     if said_any("hi", "hello", "start"):
         r.set(k_state, "collecting")
         msg.body(
@@ -105,10 +101,12 @@ def whatsapp_webhook():
             "Please send a photo or PDF of your electricity bill.\n\n"
             "When you’re finished:\n"
             "• Reply: 'add another bill' to upload more\n"
-            "• Reply: 'that's all' to finish"
+            "• Reply: 'that's all' to finish\n"
+            "• Reply: 'list bills' to see what I’ve saved"
         )
         return str(resp)
 
+    # Finish
     if said_any("that's all", "thats all", "done", "finish", "finished", "all done"):
         r.set(k_state, "done")
         count = int(r.get(k_count) or 0)
@@ -119,22 +117,47 @@ def whatsapp_webhook():
         )
         return str(resp)
 
+    # List bills (summary)
+    if said_any("list bills", "show bills", "what have you saved"):
+        # fetch up to last 10 to keep the reply short
+        entries = r.lrange(k_bills, -10, -1) or []
+        if not entries:
+            msg.body("I haven’t saved any bill files yet. Send a photo/PDF to add one.")
+            return str(resp)
+        # Format a compact summary
+        lines = []
+        for i, e in enumerate(entries, start=max(1, bill_count - len(entries) + 1)):
+            try:
+                j = json.loads(e)
+                kind = "PDF" if (j.get("media_type","").lower().endswith("pdf")) else "Image"
+                ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(j.get("ts", 0)))
+                lines.append(f"#{i}: {kind} @ {ts}")
+            except Exception:
+                lines.append(f"#{i}: (unparsed)")
+        msg.body("Recent saved bills:\n" + "\n".join(lines))
+        return str(resp)
+
+    # Add another
     if said_any("add another bill", "add another", "another bill", "add more", "upload another"):
         r.set(k_state, "collecting")
         msg.body("Cool — send the next bill photo/PDF. When finished, say “that's all”.")
         return str(resp)
 
-    # Media?
+    # Media handling (save url/type/timestamp)
     media_url = request.values.get("MediaUrl0")
     media_type = request.values.get("MediaContentType0")
-
     if state == "collecting" and media_url:
-        # (Sandbox) just count it; prod would download+parse
+        entry = {
+            "media_url": media_url,
+            "media_type": media_type or "",
+            "ts": int(time.time())
+        }
+        r.rpush(k_bills, json.dumps(entry))
         new_count = bill_count + 1
         r.set(k_count, new_count)
         msg.body(
             f"Bill received ✅ (#{new_count}).\n\n"
-            "Reply 'add another bill' to add more, or 'that's all' to finish."
+            "Reply 'add another bill' to add more, 'list bills' to review, or 'that's all' to finish."
         )
         return str(resp)
 
@@ -148,8 +171,23 @@ def whatsapp_webhook():
         msg.body("You’re done for now 🎉 Say 'hi' if you want to add more bills.")
     else:
         msg.body("Say 'hi' to get started with your bill upload.")
-
     return str(resp)
+
+
+@app.route("/user_bills", methods=["GET"])
+def user_bills():
+    """Admin helper: GET /user_bills?phone=+61XXXXXXXXX returns JSON of stored bills."""
+    import json
+    phone = request.args.get("phone", "").strip()
+    if not phone:
+        return {"error": "Missing ?phone=+61..."}, 400
+    k_bills = f"user:{phone}:bills"
+    entries = r.lrange(k_bills, 0, -1) or []
+    try:
+        parsed = [json.loads(e) for e in entries]
+    except Exception:
+        parsed = []
+    return {"phone": phone, "count": len(parsed), "bills": parsed}, 200
 
 
 if __name__ == "__main__":
