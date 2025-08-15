@@ -5,7 +5,7 @@ import re
 import time
 import json
 import requests
-from flask import Flask, request
+from flask import Flask, request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 from upstash_redis import Redis
 
@@ -19,6 +19,103 @@ if not UPSTASH_URL or not UPSTASH_TOKEN:
 
 # Use `r` consistently
 r = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
+
+def _build_digest_html(phone: str) -> str:
+    """Builds a simple weekly digest HTML from what we’ve saved in Redis."""
+    k_bills = f"user:{phone}:bills"
+    entries = r.lrange(k_bills, 0, -1) or []
+    total_bills = len(entries)
+
+    # Pull last 5 as a preview list
+    preview = []
+    for raw in entries[-5:]:
+        try:
+            j = json.loads(raw)
+        except Exception:
+            j = {"media_type": "unknown", "ts": 0}
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(j.get("ts", 0)))
+        mtype = (j.get("media_type") or "").split("/")[-1].upper()
+        preview.append(f"<li>{when} — {mtype or 'UNKNOWN'}</li>")
+
+    # Optional savings param for demo
+    savings = request.args.get("savings", "100")
+    try:
+        savings_val = float(savings)
+    except:
+        savings_val = 100.0
+
+    # Super minimal styling to make it readable
+    html = f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>SwitchBuddy Weekly Digest</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color:#0f172a; margin:0; }}
+    .wrap {{ max-width: 720px; margin: 0 auto; padding: 24px; }}
+    .card {{ background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:20px; box-shadow:0 1px 2px rgba(0,0,0,0.03); }}
+    h1 {{ font-size: 22px; margin:0 0 8px }}
+    h2 {{ font-size: 18px; margin:16px 0 8px }}
+    p  {{ margin: 8px 0 }}
+    .cta {{ display:inline-block; padding:10px 14px; border-radius:10px; text-decoration:none; border:1px solid #0ea5e9; }}
+    .cta-primary {{ background:#0ea5e9; color:white; border-color:#0ea5e9; }}
+    ul {{ margin:8px 0 0 18px }}
+    .muted {{ color:#64748b }}
+    .grid {{ display:grid; gap:12px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }}
+    .panel {{ border:1px solid #e2e8f0; border-radius:10px; padding:12px; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>⚡ SwitchBuddy — Weekly Digest</h1>
+      <p class="muted">Phone: {phone}</p>
+
+      <div class="grid">
+        <div class="panel">
+          <h2>Summary</h2>
+          <p>Saved bills on file: <strong>{total_bills}</strong></p>
+          <p>Projected annual savings: <strong>${savings_val:,.0f}</strong></p>
+        </div>
+
+        <div class="panel">
+          <h2>Latest uploads</h2>
+          {"<ul>" + "".join(preview) + "</ul>" if preview else "<p class='muted'>No recent bills.</p>"}
+        </div>
+      </div>
+
+      <h2 style="margin-top:16px">Recommendation</h2>
+      <p>Based on your recent usage and current market rates, you’re a good candidate to switch to a <strong>low daily charge</strong> plan.</p>
+      <p class="muted">(*Demo text*) We’ll refine this once we parse TOU blocks and compare against live rates.</p>
+
+      <p style="margin-top:16px">
+        <a class="cta cta-primary" href="#">Switch plan</a>
+        <a class="cta" href="#">See full comparison</a>
+      </p>
+    </div>
+  </div>
+</body>
+</html>
+"""
+    return html
+
+
+@app.route("/digest", methods=["GET"])
+def digest():
+    """
+    Preview the weekly digest in the browser.
+    Usage:
+      /digest?phone=+61457344494
+      /digest?phone=+61457344494&savings=150
+    """
+    phone = request.args.get("phone", "").strip()
+    if not phone:
+        return {"error": "Missing ?phone=+61XXXXXXXXX"}, 400
+    html = _build_digest_html(phone)
+    return Response(html, mimetype="text/html")
+
 
 # -----------------------------
 # Helpers
