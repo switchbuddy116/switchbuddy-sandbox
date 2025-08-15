@@ -455,26 +455,31 @@ def whatsapp_webhook():
         msg.body(f"Here’s your digest preview:\n{digest_url}")
         return str(resp)
 
-    # Finish
+        # Finish
     if said_any("that's all", "thats all", "done", "finish", "finished", "all done"):
         r.set(k_state, "done")
         count = int(r.get(k_count) or 0)
+
+        # Run comparison now and stash snapshot; include savings in the reply
+        cmp = compare_and_store(phone)
+        savings = cmp.get("projected_savings", 0.0)
 
         if PUBLIC_BASE_URL:
             digest_url = f"{PUBLIC_BASE_URL}/digest_preview?phone={quote(phone, safe='')}"
             msg.body(
                 f"All set! I’ve saved {count} bill(s).\n"
-                "I’ll crunch the numbers and include them in your weekly digest.\n\n"
-                f"Preview it here: {digest_url}\n\n"
+                f"Projected annual savings: ${savings:,.0f}.\n\n"
+                f"Preview your weekly digest here: {digest_url}\n\n"
                 "If you want to add more later, just say 'hi'."
             )
         else:
             msg.body(
                 f"All set! I’ve saved {count} bill(s).\n"
-                "I’ll crunch the numbers and include them in your weekly digest. "
-                "If you want to add more later, just say 'hi'."
+                f"Projected annual savings: ${savings:,.0f}.\n"
+                "I’ll include this in your weekly digest. If you want to add more later, just say 'hi'."
             )
         return str(resp)
+
 
     # List bills
     if said_any("list bills", "show bills", "what have you saved"):
@@ -579,46 +584,6 @@ def whatsapp_webhook():
     else:
         msg.body("Say 'hi' to get started with your bill upload.")
     return str(resp)
-
-# After content, fetched_type, size_bytes = download_twilio_media(...)
-parsed = parse_bill_bytes(content, fetched_type or (media_type or ""))
-
-entry = {
-    "media_url": media_url,
-    "media_type": media_type or fetched_type or "",
-    "ts": int(time.time()),
-    "downloaded_ok": True,
-    "download_err": None,
-    "download_size_bytes": size_bytes,
-    "parsed": parsed,  # <--- store the structured result
-}
-r.rpush(k_bills, json.dumps(entry))
-
-if said_any("that's all", "thats all", "done", "finish", "finished", "all done"):
-    r.set(k_state, "done")
-    count = int(r.get(k_count) or 0)
-    cmp = compare_and_store(phone)
-    savings = cmp.get("projected_savings", 0.0)
-    msg.body(
-        f"All set! I’ve saved {count} bill(s).\n"
-        f"Projected annual savings right now: ${savings:,.0f}.\n"
-        "I’ll include this in your weekly digest. Say 'digest' to preview."
-    )
-    return str(resp)
-
-snap_raw = r.get(f"user:{phone}:last_comparison")
-if snap_raw:
-    try:
-        if isinstance(snap_raw, bytes):
-            snap_raw = snap_raw.decode("utf-8", errors="ignore")
-        snap = json.loads(snap_raw)
-        best_name = snap["best"]["plan"]["name"]
-        best_cost = snap["best"]["annual_cost"]
-        savings = snap["projected_savings"]
-        # add a small “Best plan” panel into your existing HTML
-        # (you can weave this into your template where you like)
-    except Exception:
-        pass
 
 
 # -----------------------------
