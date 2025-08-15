@@ -4,11 +4,7 @@ import os
 import time
 import json
 import requests
-import re
-import io
-import datetime
-from PyPDF2 import PdfReader
-from flask import Flask, request
+from flask import Flask, request, Markup
 from twilio.twiml.messaging_response import MessagingResponse
 from upstash_redis import Redis
 
@@ -21,7 +17,6 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_TOKEN")
 if not UPSTASH_URL or not UPSTASH_TOKEN:
     raise RuntimeError("Missing UPSTASH_URL or UPSTASH_TOKEN environment variables.")
 
-# Upstash client (simple HTTP-based Redis)
 r = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
 
 # -----------------------------
@@ -40,13 +35,16 @@ def health():
 def redis_diag():
     try:
         pong = r.ping()
+        pref = ""
+        if UPSTASH_URL and ".upstash.io" in UPSTASH_URL:
+            pref = UPSTASH_URL[: UPSTASH_URL.find(".upstash.io") + len(".upstash.io")]
         return {
             "connected": True,
             "error": None,
             "has_token": bool(UPSTASH_TOKEN),
             "has_url": bool(UPSTASH_URL),
             "ping": pong,
-            "url_prefix": (UPSTASH_URL or "")[: (UPSTASH_URL.find(".upstash.io") + 12)] if UPSTASH_URL else ""
+            "url_prefix": pref
         }, 200
     except Exception as e:
         return {
@@ -63,21 +61,21 @@ def download_twilio_media(media_url: str, timeout=15):
     """
     Downloads a Twilio-hosted media URL using HTTP Basic Auth.
     Returns (content_bytes, content_type, content_length_int).
+    Raises Exception on failure.
     """
     sid = os.environ.get("TWILIO_ACCOUNT_SID")
     token = os.environ.get("TWILIO_AUTH_TOKEN")
     if not sid or not token:
-        raise RuntimeError("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN env vars.")
+        raise RuntimeError("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN.")
 
     max_bytes = 10 * 1024 * 1024  # 10 MB soft cap for sandbox
     with requests.get(media_url, auth=(sid, token), stream=True, timeout=timeout) as resp:
         resp.raise_for_status()
         content_type = resp.headers.get("Content-Type", "")
         content_len_header = resp.headers.get("Content-Length")
-        content_length = int(content_len_header) if (content_len_header or "").isdigit() else None
+        content_length = int(content_len_header) if content_len_header and content_len_header.isdigit() else None
 
-        chunks = []
-        total = 0
+        chunks, total = [], 0
         for chunk in resp.iter_content(chunk_size=8192):
             if chunk:
                 chunks.append(chunk)
@@ -87,68 +85,6 @@ def download_twilio_media(media_url: str, timeout=15):
         content = b"".join(chunks)
 
     return content, content_type, (content_length if content_length is not None else len(content))
-
-def _pdf_to_text(pdf_bytes: bytes) -> str:
-    """Extract text from a PDF (best-effort)."""
-    with io.BytesIO(pdf_bytes) as bio:
-        r = PdfReader(bio)
-        pages = []
-        for p in r.pages:
-            try:
-                pages.append(p.extract_text() or "")
-            except Exception:
-                pages.append("")
-        return "\n".join(pages)
-
-def _extract_bill_metrics_from_text(text: str) -> dict:
-    """
-    Heuristic scrapes for common bill fields:
-    - usage kWh
-    - total amount due ($)
-    - daily supply charge
-    - per-kWh rates (c/kWh)
-    """
-    metrics = {
-        "usage_kwh": None,
-        "total_amount": None,
-        "daily_supply": None,
-        "peak_rate_c_per_kwh": None,
-        "offpeak_rate_c_per_kwh": None,
-    }
-
-    t = text.lower()
-
-    # Usage e.g. "1234 kWh"
-    m = re.search(r'(\d{2,6})\s*kwh', t, re.I)
-    if m:
-        try:
-            metrics["usage_kwh"] = int(m.group(1))
-        except Exception:
-            pass
-
-    # Total due e.g. "Total due $123.45" or "Total amount $123.45"
-    m = re.search(r'total(?:\s+amount|\s+due|\s+bill)?\s*\$?\s*([0-9]+(?:\.[0-9]{2})?)', t, re.I)
-    if m:
-        metrics["total_amount"] = float(m.group(1))
-
-    # Daily supply e.g. "$1.01/day" or "110.00 c/day"
-    m = re.search(r'\$([0-9]+(?:\.[0-9]{2})?)\s*/\s*day', t, re.I)
-    if m:
-        metrics["daily_supply"] = f"${m.group(1)}/day"
-    else:
-        m = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*c\s*/\s*day', t, re.I)
-        if m:
-            metrics["daily_supply"] = f"{m.group(1)} c/day"
-
-    # Rates (grab first two as peak/off-peak if present)
-    rates = re.findall(r'([0-9]+(?:\.[0-9]+)?)\s*c\s*/?\s*kwh', t, re.I)
-    if rates:
-        metrics["peak_rate_c_per_kwh"] = float(rates[0])
-        if len(rates) > 1:
-            metrics["offpeak_rate_c_per_kwh"] = float(rates[1])
-
-    return metrics
-
 
 # -----------------------------
 # Simple session smoke tests
@@ -166,10 +102,9 @@ def get_session():
     return f"Value from Redis: {value}", 200
 
 # -----------------------------
-# Helpers
+# Helper: normalize user text
 # -----------------------------
 def _normalize_text(s: str) -> str:
-    """Normalize curly quotes, dashes, whitespace, then lowercase + strip punctuation."""
     if not s:
         return ""
     normalized = (
@@ -274,12 +209,13 @@ def whatsapp_webhook():
             except Exception:
                 pass
 
-        # %2B-encode the plus sign
-        phone_param = f"%2B{from_number}" if from_number.startswith("+") else f"%2B{from_number}"
+        phone_num = from_number.lstrip("+")
+        phone_param = f"%2B{phone_num}"
         preview_url = f"https://{request.host}/digest_preview?phone={phone_param}"
 
         facts = [
             f"Total bills saved: {count}",
+            f"Last bill uploaded: {time.strftime('%Y-%m-%d %H:%M', time.localtime(last_ts)) if last_ts else 'n/a'}",
             f"Last bill type: {last_type or 'n/a'}",
             f"Fetched from Twilio: {'yes' if last_fetched else 'no' if last_fetched is not None else 'n/a'}",
             f"Last file size: {f'{last_size/1024:.0f} KB' if isinstance(last_size, int) else 'n/a'}",
@@ -305,6 +241,7 @@ def whatsapp_webhook():
         try:
             content, fetched_type, size_bytes = download_twilio_media(media_url)
             downloaded_ok = True
+            # (Not persisting the file yet in sandbox)
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
 
@@ -349,15 +286,62 @@ def whatsapp_webhook():
     return str(resp)
 
 # -----------------------------
-# Admin/testing: list saved bills as JSON
+# Digest preview page (HTML)
+# -----------------------------
+@app.route("/digest_preview", methods=["GET"])
+def digest_preview():
+    phone = (request.args.get("phone", "") or "").lstrip("+")
+    if not phone:
+        return "Missing ?phone=%2B<digits>", 400
+
+    k_bills = f"user:+{phone}:bills"
+    entries = r.lrange(k_bills, 0, -1) or []
+    count = len(entries)
+
+    last = entries[-1] if entries else None
+    facts = {
+        "Total bills saved": count,
+        "Last bill uploaded": "n/a",
+        "Last bill type": "n/a",
+        "Fetched from Twilio": "n/a",
+        "Last file size": "n/a"
+    }
+    if last:
+        try:
+            j = json.loads(last)
+            ts = j.get("ts")
+            facts["Last bill uploaded"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "n/a"
+            mt = j.get("media_type") or ""
+            facts["Last bill type"] = mt or "n/a"
+            dlok = j.get("downloaded_ok")
+            facts["Fetched from Twilio"] = "yes" if dlok else "no" if dlok is not None else "n/a"
+            sz = j.get("download_size_bytes")
+            facts["Last file size"] = (f"{sz/1024:.0f} KB" if isinstance(sz, int) else "n/a")
+        except Exception:
+            pass
+
+    # Simple HTML (unstyled on purpose for now)
+    rows = "\n".join(f"<li><b>{Markup.escape(k)}:</b> {Markup.escape(str(v))}</li>" for k, v in facts.items())
+    html = f"""
+    <html>
+    <head><title>Weekly Digest (Preview)</title></head>
+    <body>
+      <h2>Weekly Digest (Preview)</h2>
+      <p>for +{phone}</p>
+      <ul>
+        {rows}
+      </ul>
+      <p>Next step: we’ll parse usage from PDFs/images and compare plan options.</p>
+    </body>
+    </html>
+    """
+    return html, 200
+
+# -----------------------------
+# Admin/testing helpers
 # -----------------------------
 @app.route("/user_bills", methods=["GET"])
 def user_bills():
-    """
-    Admin helper:
-      GET /user_bills?phone=+61XXXXXXXXX
-    Returns JSON of saved bill entries for that phone.
-    """
     phone = request.args.get("phone", "").strip()
     if not phone:
         return {"error": "Missing ?phone=+61..."}, 400
@@ -373,7 +357,6 @@ def user_bills():
 
 @app.route("/last_bill", methods=["GET"])
 def last_bill():
-    """Quick debug: /last_bill?phone=+61XXXXXXXXX -> shows last saved bill entry."""
     phone = request.args.get("phone", "").strip()
     if not phone:
         return {"error": "Missing ?phone=+61..."}, 400
@@ -385,85 +368,6 @@ def last_bill():
         return {"phone": phone, "last_bill": json.loads(last)}, 200
     except Exception:
         return {"phone": phone, "last_bill": {"raw": last}}, 200
-
-import datetime
-
-def _humansize(nbytes: int) -> str:
-    if not isinstance(nbytes, int):
-        return "unknown"
-    for unit in ["B","KB","MB","GB"]:
-        if nbytes < 1024.0:
-            return f"{nbytes:.1f} {unit}"
-        nbytes /= 1024.0
-    return f"{nbytes:.1f} TB"
-
-def _humants(ts: int) -> str:
-    try:
-        return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return "unknown"
-
-@app.route("/digest_preview", methods=["GET"])
-def digest_preview():
-    """
-    Quick HTML preview of what we'll include in the weekly digest.
-    Usage: /digest_preview?phone=%2B61XXXXXXXXX
-    """
-    phone = request.args.get("phone", "").strip()
-    if not phone:
-        return ("<h3>Missing ?phone= parameter. Example:</h3>"
-                "<code>/digest_preview?phone=%2B61457344494</code>", 400)
-
-    k_count = f"user:{phone}:bill_count"
-    k_bills = f"user:{phone}:bills"
-
-    count = int(r.get(k_count) or 0)
-    last_raw = r.lindex(k_bills, -1)
-    last = {}
-    if last_raw:
-        try:
-            last = json.loads(last_raw)
-        except Exception:
-            last = {"raw": str(last_raw)}
-
-    media_type = last.get("media_type", "unknown")
-    ts = _humants(last.get("ts", 0))
-    size = _humansize(int(last.get("download_size_bytes", 0) or 0))
-    fetched = "yes" if last.get("downloaded_ok") else "no"
-
-    html = f"""
-    <html>
-      <head>
-        <meta charset="utf-8" />
-        <title>SwitchBuddy – Digest Preview</title>
-        <style>
-          body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 24px; }}
-          .card {{ max-width: 640px; border: 1px solid #eee; border-radius: 12px; padding: 20px; }}
-          h1 {{ margin: 0 0 8px; }}
-          .muted {{ color: #666; }}
-          ul {{ line-height: 1.6; }}
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <h1>Weekly Digest (Preview)</h1>
-          <div class="muted">for {phone}</div>
-          <hr />
-          <h3>Bill uploads</h3>
-          <ul>
-            <li><strong>Total bills saved:</strong> {count}</li>
-            <li><strong>Last bill uploaded:</strong> {ts}</li>
-            <li><strong>Last bill type:</strong> {media_type}</li>
-            <li><strong>Fetched from Twilio:</strong> {fetched}</li>
-            <li><strong>Last file size:</strong> {size}</li>
-          </ul>
-          <p class="muted">Next step: we’ll parse usage from PDFs/images and compute plan comparisons.</p>
-        </div>
-      </body>
-    </html>
-    """
-    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
-
 
 # -----------------------------
 # Entrypoint
