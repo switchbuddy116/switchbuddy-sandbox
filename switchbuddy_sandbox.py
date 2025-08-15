@@ -3,6 +3,7 @@
 import os
 import time
 import json
+import requests
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from upstash_redis import Redis
@@ -51,6 +52,42 @@ def redis_diag():
             "has_token": bool(UPSTASH_TOKEN),
             "has_url": bool(UPSTASH_URL),
         }, 500
+# -----------------------------
+# Twilio media download helper
+# -----------------------------
+def download_twilio_media(media_url: str, timeout=15):
+    """
+    Downloads a Twilio-hosted media URL using HTTP Basic Auth.
+    Returns (content_bytes, content_type, content_length_int).
+    Raises Exception on failure.
+    """
+    sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    token = os.environ.get("TWILIO_AUTH_TOKEN")
+
+    if not sid or not token:
+        raise RuntimeError("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN.")
+
+    # Twilio media URLs require Basic Auth with Account SID/Auth Token
+    # We stream to avoid huge memory use; for now we cap at ~10MB.
+    max_bytes = 10 * 1024 * 1024  # 10 MB soft cap for sandbox
+    with requests.get(media_url, auth=(sid, token), stream=True, timeout=timeout) as resp:
+        resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "")
+        content_len_header = resp.headers.get("Content-Length")
+        content_length = int(content_len_header) if content_len_header and content_len_header.isdigit() else None
+
+        # Read up to max_bytes
+        chunks = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(f"Media exceeds {max_bytes} bytes limit for sandbox.")
+        content = b"".join(chunks)
+
+    return content, content_type, (content_length if content_length is not None else len(content))
 
 # -----------------------------
 # Simple session smoke tests
@@ -168,24 +205,57 @@ def whatsapp_webhook():
         msg.body("Cool — send the next bill photo/PDF. When finished, say “that's all”.")
         return str(resp)
 
-    # Media handling (Twilio sends MediaUrl0/MediaContentType0 when files attached)
-    media_url = request.values.get("MediaUrl0")
-    media_type = request.values.get("MediaContentType0")
+# Media handling (Twilio sends MediaUrl0/MediaContentType0 when files attached)
+media_url = request.values.get("MediaUrl0")
+media_type = request.values.get("MediaContentType0")
 
-    if state == "collecting" and media_url:
-        entry = {
-            "media_url": media_url,
-            "media_type": media_type or "",
-            "ts": int(time.time())
-        }
-        r.rpush(k_bills, json.dumps(entry))
-        new_count = bill_count + 1
-        r.set(k_count, new_count)
+if state == "collecting" and media_url:
+    # Try to fetch the media from Twilio (auth required)
+    downloaded_ok = False
+    size_bytes = None
+    fetched_type = None
+    err = None
+    try:
+        content, fetched_type, size_bytes = download_twilio_media(media_url)
+        downloaded_ok = True
+        # (Sandbox) We’re not storing files yet; just proving we can fetch them.
+        # If you want to keep a tiny sample, you could write to /tmp here.
+        # with open(f"/tmp/bill_{int(time.time())}.bin", "wb") as f:
+        #     f.write(content)
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+
+    entry = {
+        "media_url": media_url,                 # Twilio temp URL (expires eventually)
+        "media_type": media_type or fetched_type or "",
+        "ts": int(time.time()),
+        "downloaded_ok": downloaded_ok,
+        "download_err": err,
+        "download_size_bytes": size_bytes
+    }
+    r.rpush(k_bills, json.dumps(entry))
+    new_count = bill_count + 1
+    r.set(k_count, new_count)
+
+    if downloaded_ok:
+        human_size = f"{size_bytes/1024:.1f} KB" if size_bytes and size_bytes < 1024*1024 else (
+            f"{size_bytes/1024/1024:.2f} MB" if size_bytes else "unknown size"
+        )
         msg.body(
-            f"Bill received ✅ (#{new_count}).\n\n"
+            f"Bill received ✅ (#{new_count}).\n"
+            f"(Fetched media: {human_size})\n\n"
             "Reply 'add another bill' to add more, 'list bills' to review, or 'that's all' to finish."
         )
-        return str(resp)
+    else:
+        msg.body(
+            f"Bill received ✅ (#{new_count}).\n"
+            "Heads up: I couldn’t fetch the file from Twilio just now, but the link was saved. "
+            "You can try sending it again, or proceed.\n\n"
+            "Reply 'add another bill' to add more, 'list bills' to review, or 'that's all' to finish."
+        )
+    return str(resp)
+
+
 
     # Fallbacks based on state
     if state == "collecting":
@@ -221,6 +291,20 @@ def user_bills():
         except Exception:
             parsed.append({"raw": e})
     return {"phone": phone, "count": len(parsed), "bills": parsed}, 200
+@app.route("/last_bill", methods=["GET"])
+def last_bill():
+    """Quick debug: /last_bill?phone=+61XXXXXXXXX -> shows last saved bill entry."""
+    phone = request.args.get("phone", "").strip()
+    if not phone:
+        return {"error": "Missing ?phone=+61..."}, 400
+    k_bills = f"user:{phone}:bills"
+    last = r.lindex(k_bills, -1)
+    if not last:
+        return {"phone": phone, "last_bill": None}, 200
+    try:
+        return {"phone": phone, "last_bill": json.loads(last)}, 200
+    except Exception:
+        return {"phone": phone, "last_bill": {"raw": last}}, 200
 
 # -----------------------------
 # Entrypoint
