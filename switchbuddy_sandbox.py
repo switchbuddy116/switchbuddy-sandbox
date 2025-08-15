@@ -5,16 +5,14 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 app = Flask(__name__)
 
-# ----- Redis client (REDIS_URL must be redis://... or rediss://...) -----
 REDIS_URL = os.environ.get("REDIS_URL", "")
 r = None
 if REDIS_URL and (REDIS_URL.startswith("redis://") or REDIS_URL.startswith("rediss://")):
     try:
         r = redis.from_url(REDIS_URL, decode_responses=True, ssl=REDIS_URL.startswith("rediss://"))
     except Exception:
-        r = None  # app still runs even if redis fails
+        r = None
 
-# ----- Session helpers (keyed by WhatsApp number) -----
 def _default_session():
     return {"state": "NEW", "bills": [], "updated_at": time.time()}
 
@@ -32,12 +30,10 @@ def save_session(phone_number: str, data: dict, ttl_seconds: int = 60*60*24*30):
     if r:
         r.set(f"sess:{phone_number}", json.dumps(data, separators=(",", ":")), ex=ttl_seconds)
 
-# ----- Health -----
 @app.route("/health", methods=["GET"])
 def health():
     return "ok", 200
 
-# ----- Quick Redis test (optional) -----
 @app.route("/set_session")
 def set_session():
     if not r:
@@ -51,7 +47,6 @@ def get_session():
         return "Redis not configured (check REDIS_URL)", 500
     return f"Value from Redis: {r.get('test_key')}", 200
 
-# ----- Demo bill + offers -----
 SAMPLE_BILL = {
     "retailer": "Alinta Energy",
     "period": "12 Jun → 13 Jul (32 days)",
@@ -91,7 +86,6 @@ def bill_summary_text(b):
     ]
     return "\n".join(lines)
 
-# ----- WhatsApp webhook -----
 @app.route("/whatsapp/webhook", methods=["POST"])
 def whatsapp_webhook():
     from_number = request.form.get("From", "unknown")
