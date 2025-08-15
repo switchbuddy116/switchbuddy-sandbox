@@ -4,6 +4,26 @@ import os
 import time
 import json
 import requests
+import re
+
+def e164(raw: str) -> str:
+    """
+    Normalize a phone to E.164-ish for our Redis keys.
+    - strips 'whatsapp:' prefix
+    - keeps digits and leading '+'
+    - if no leading '+', add it
+    """
+    if not raw:
+        return ""
+    s = raw.strip().replace("whatsapp:", "")
+    # keep digits and '+' only; collapse spaces etc.
+    s = "".join(ch for ch in s if ch.isdigit() or ch == "+")
+    if not s:
+        return ""
+    if s[0] != "+":
+        s = "+" + s
+    return s
+
 from flask import Flask, request, Markup
 from twilio.twiml.messaging_response import MessagingResponse
 from upstash_redis import Redis
@@ -120,14 +140,14 @@ def _normalize_text(s: str) -> str:
 # -----------------------------
 @app.route("/whatsapp/webhook", methods=["POST"])
 def whatsapp_webhook():
-    from_number = (request.values.get("From") or "").replace("whatsapp:", "")
-    raw = (request.values.get("Body") or "")
-    incoming_msg = _normalize_text(raw)
+  
+from_number_raw = request.values.get("From") or ""
+phone = e164(from_number_raw)
 
-    # Per-user keys
-    k_state = f"user:{from_number}:state"        # idle|collecting|done
-    k_count = f"user:{from_number}:bill_count"   # integer
-    k_bills = f"user:{from_number}:bills"        # LIST of JSON entries
+k_state = f"user:{phone}:state"
+k_count = f"user:{phone}:bill_count"
+k_bills = f"user:{phone}:bills"
+
 
     # Init defaults
     if r.get(k_state) is None:
@@ -290,48 +310,102 @@ def whatsapp_webhook():
 # -----------------------------
 @app.route("/digest_preview", methods=["GET"])
 def digest_preview():
-    phone = (request.args.get("phone", "") or "").lstrip("+")
+    phone = e164(request.args.get("phone", ""))
     if not phone:
-        return "Missing ?phone=%2B<digits>", 400
+        return "Missing ?phone=E164 (e.g., ?phone=%2B6145...)", 400
 
-    k_bills = f"user:+{phone}:bills"
-    entries = r.lrange(k_bills, 0, -1) or []
-    count = len(entries)
+    k_state = f"user:{phone}:state"
+    k_count = f"user:{phone}:bill_count"
+    k_bills = f"user:{phone}:bills"
 
-    last = entries[-1] if entries else None
-    facts = {
-        "Total bills saved": count,
-        "Last bill uploaded": "n/a",
-        "Last bill type": "n/a",
-        "Fetched from Twilio": "n/a",
-        "Last file size": "n/a"
-    }
-    if last:
+    # Load entries and parse JSON safely
+    raw_entries = r.lrange(k_bills, 0, -1) or []
+    entries = []
+    for e in raw_entries:
         try:
-            j = json.loads(last)
-            ts = j.get("ts")
-            facts["Last bill uploaded"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "n/a"
-            mt = j.get("media_type") or ""
-            facts["Last bill type"] = mt or "n/a"
-            dlok = j.get("downloaded_ok")
-            facts["Fetched from Twilio"] = "yes" if dlok else "no" if dlok is not None else "n/a"
-            sz = j.get("download_size_bytes")
-            facts["Last file size"] = (f"{sz/1024:.0f} KB" if isinstance(sz, int) else "n/a")
+            if isinstance(e, bytes):
+                e = e.decode("utf-8", errors="ignore")
+            entries.append(json.loads(e))
         except Exception:
-            pass
+            entries.append({"raw": str(e)})
 
-    # Simple HTML (unstyled on purpose for now)
-    rows = "\n".join(f"<li><b>{Markup.escape(k)}:</b> {Markup.escape(str(v))}</li>" for k, v in facts.items())
+    saved_count = len(entries)
+    if saved_count == 0:
+        # fall back to the counter if list is empty
+        try:
+            saved_count = int(r.get(k_count) or 0)
+        except Exception:
+            saved_count = 0
+
+    # Build simple HTML digest
+    def fmt_size(b):
+        if not b:
+            return "—"
+        try:
+            b = int(b)
+        except Exception:
+            return str(b)
+        if b < 1024:
+            return f"{b} B"
+        if b < 1024*1024:
+            return f"{b/1024:.1f} KB"
+        return f"{b/1024/1024:.2f} MB"
+
+    rows = []
+    for i, item in enumerate(entries, start=1):
+        ts = item.get("ts")
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "—"
+        mtype = item.get("media_type", "—")
+        ok = "yes" if item.get("downloaded_ok") else "no"
+        err = item.get("download_err") or ""
+        size = fmt_size(item.get("download_size_bytes"))
+        rows.append(f"""
+          <tr>
+            <td style="padding:6px;border:1px solid #ddd;">{i}</td>
+            <td style="padding:6px;border:1px solid #ddd;">{when}</td>
+            <td style="padding:6px;border:1px solid #ddd;">{mtype}</td>
+            <td style="padding:6px;border:1px solid #ddd;">{size}</td>
+            <td style="padding:6px;border:1px solid #ddd;">{ok}</td>
+            <td style="padding:6px;border:1px solid #ddd;max-width:280px;word-wrap:break-word;">{err}</td>
+          </tr>
+        """)
+
+    table_html = (
+        "<p>No bills saved yet for this number.</p>"
+        if not rows else
+        f"""
+        <table style="border-collapse:collapse;border:1px solid #ddd;font-family:Arial,sans-serif;font-size:14px;">
+          <thead>
+            <tr style="background:#f7f7f7;">
+              <th style="padding:6px;border:1px solid #ddd;">#</th>
+              <th style="padding:6px;border:1px solid #ddd;">When</th>
+              <th style="padding:6px;border:1px solid #ddd;">Type</th>
+              <th style="padding:6px;border:1px solid #ddd;">Size</th>
+              <th style="padding:6px;border:1px solid #ddd;">Fetched</th>
+              <th style="padding:6px;border:1px solid #ddd;">Note</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(rows)}
+          </tbody>
+        </table>
+        """
+    )
+
     html = f"""
+    <!doctype html>
     <html>
-    <head><title>Weekly Digest (Preview)</title></head>
-    <body>
-      <h2>Weekly Digest (Preview)</h2>
-      <p>for +{phone}</p>
-      <ul>
-        {rows}
-      </ul>
-      <p>Next step: we’ll parse usage from PDFs/images and compare plan options.</p>
+    <head>
+      <meta charset="utf-8" />
+      <title>SwitchBuddy – Weekly Digest Preview</title>
+    </head>
+    <body style="margin:24px;font-family:Arial,Helvetica,sans-serif;">
+      <h2>Weekly Digest Preview</h2>
+      <p><strong>Phone:</strong> {phone}</p>
+      <p><strong>Bills saved:</strong> {saved_count}</p>
+      {table_html}
+      <hr>
+      <p style="color:#666;">(Sandbox preview – data reflects your current uploads.)</p>
     </body>
     </html>
     """
