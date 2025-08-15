@@ -1,14 +1,38 @@
 # switchbuddy_sandbox.py
 
 import os
+import io
+import re
 import time
 import json
 import requests
 from urllib.parse import quote
+from datetime import datetime
 
 from flask import Flask, request, Response, redirect
 from twilio.twiml.messaging_response import MessagingResponse
 from upstash_redis import Redis
+
+# ----- Optional OCR libs -----
+# These imports are optional; we check availability at runtime.
+try:
+    from google.cloud import vision as gcv
+    _HAS_GCV = True
+except Exception:
+    _HAS_GCV = False
+
+try:
+    import pytesseract
+    from PIL import Image
+    _HAS_TESS = True
+except Exception:
+    _HAS_TESS = False
+
+try:
+    from PyPDF2 import PdfReader
+    _HAS_PYPDF2 = True
+except Exception:
+    _HAS_PYPDF2 = False
 
 # -----------------------------
 # Redis (Upstash) client
@@ -18,11 +42,34 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_TOKEN")
 if not UPSTASH_URL or not UPSTASH_TOKEN:
     raise RuntimeError("Missing UPSTASH_URL or UPSTASH_TOKEN environment variables.")
 
-# Use `r` consistently
 r = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
 
 # Your public base URL (e.g., https://switchbuddy-sandbox.onrender.com)
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+
+# -----------------------------
+# Google Vision bootstrap (optional)
+# -----------------------------
+def _maybe_bootstrap_gcv() -> bool:
+    """
+    If GOOGLE_APPLICATION_CREDENTIALS_JSON is set, write it to /tmp and
+    point GOOGLE_APPLICATION_CREDENTIALS there so google-cloud-vision works.
+    """
+    creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if not creds_json:
+        return False
+    try:
+        path = "/tmp/gcp_creds.json"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(creds_json)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
+        return True
+    except Exception:
+        return False
+
+_GCV_READY = False
+if _HAS_GCV:
+    _GCV_READY = _maybe_bootstrap_gcv()
 
 # -----------------------------
 # Flask app
@@ -33,35 +80,8 @@ app = Flask(__name__)
 # Helpers
 # -----------------------------
 
-# ---- Bill parsing (stub using OCR/API later) ----
-def parse_bill_bytes(content: bytes, content_type: str) -> dict:
-    """
-    TODO: Replace with real OCR/API.
-    For now, return a plausible structure so compare works end-to-end.
-    """
-    # Demo defaults
-    return {
-        "period_start": "2025-06-01",
-        "period_end": "2025-08-01",
-        "total_kwh": 1200,             # 2 months worth (example)
-        "daily_kwh": round(1200 / 62, 2),
-        "supply_cents_per_day": 110,   # $1.10/day
-        "usage_cents_per_kwh_peak": 40,
-        "usage_cents_per_kwh_shoulder": 28,
-        "usage_cents_per_kwh_offpeak": 22,
-        "tariff_type": "TOU",
-        "distributor": "CitiPower",    # example
-        "total_cost_inc_gst": 540.00
-    }
-
-
 def e164(raw: str) -> str:
-    """
-    Normalize a phone for Redis keys:
-    - strips 'whatsapp:' prefix
-    - keeps digits and leading '+'
-    - adds '+' if missing
-    """
+    """Normalize a WhatsApp/phone value to +E164 for Redis keys."""
     if not raw:
         return ""
     s = raw.strip().replace("whatsapp:", "")
@@ -71,7 +91,6 @@ def e164(raw: str) -> str:
     if s[0] != "+":
         s = "+" + s
     return s
-
 
 def _normalize_text(s: str) -> str:
     """Normalize curly quotes, dashes, collapse whitespace, lowercase, strip punct."""
@@ -88,19 +107,17 @@ def _normalize_text(s: str) -> str:
     )
     return " ".join(normalized.split()).lower().strip(" .!?,;:'\"-")
 
-
 def download_twilio_media(media_url: str, timeout=15):
     """
     Downloads a Twilio-hosted media URL using HTTP Basic Auth.
     Returns (content_bytes, content_type, content_length_int).
-    Raises Exception on failure.
     """
     sid = os.environ.get("TWILIO_ACCOUNT_SID")
     token = os.environ.get("TWILIO_AUTH_TOKEN")
     if not sid or not token:
         raise RuntimeError("Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN.")
 
-    max_bytes = 10 * 1024 * 1024  # 10 MB cap for sandbox
+    max_bytes = 10 * 1024 * 1024  # 10 MB cap
     with requests.get(media_url, auth=(sid, token), stream=True, timeout=timeout) as resp:
         resp.raise_for_status()
         content_type = resp.headers.get("Content-Type", "")
@@ -114,19 +131,337 @@ def download_twilio_media(media_url: str, timeout=15):
                 chunks.append(chunk)
                 total += len(chunk)
                 if total > max_bytes:
-                    raise ValueError(f"Media exceeds {max_bytes} bytes limit for sandbox.")
+                    raise ValueError(f"Media exceeds {max_bytes} bytes limit.")
         content = b"".join(chunks)
 
     return content, content_type, (content_length if content_length is not None else len(content))
 
+# ---------- OCR & parsing pipeline ----------
+
+_DATE_PAT = re.compile(
+    r'(?P<d>\d{1,2})[\/\-\s](?P<m>\d{1,2}|[A-Za-z]{3,9})[\/\-\s](?P<y>\d{2,4})',
+    re.IGNORECASE
+)
+_KWH_PAT = re.compile(r'(?<![\d\.])(?P<kwh>\d{2,6}(?:\.\d+)?)\s*kwh\b', re.IGNORECASE)
+_SUPPLY_CPD_PAT = re.compile(r'(supply|daily)\s+charge.*?(?P<cents>\d{1,4}(?:\.\d+)?)\s*c(?:ents)?\/?day', re.IGNORECASE)
+_USAGE_FLAT_PAT = re.compile(r'(usage|energy)\s+charge.*?(?P<cents>\d{1,4}(?:\.\d+)?)\s*c(?:ents)?\/?kwh', re.IGNORECASE)
+_TOU_PEAK_PAT = re.compile(r'peak.*?(?P<cents>\d{1,4}(?:\.\d+)?)\s*c(?:ents)?\/?kwh', re.IGNORECASE)
+_TOU_SHOULDER_PAT = re.compile(r'shoulder.*?(?P<cents>\d{1,4}(?:\.\d+)?)\s*c(?:ents)?\/?kwh', re.IGNORECASE)
+_TOU_OFFPEAK_PAT = re.compile(r'(off-?peak|off peak).*?(?P<cents>\d{1,4}(?:\.\d+)?)\s*c(?:ents)?\/?kwh', re.IGNORECASE)
+_TARIFF_TOU_HINT = re.compile(r'\b(TOU|time\s*of\s*use)\b', re.IGNORECASE)
+_COST_TOTAL_PAT = re.compile(r'\$\s?(?P<amt>\d{2,6}(?:\.\d{2})?)\s*(inc\.?\s*gst|incl\.?\s*gst|incl gst)?', re.IGNORECASE)
+
+_MONTH_MAP = {
+    'jan':1,'january':1,'feb':2,'february':2,'mar':3,'march':3,'apr':4,'april':4,
+    'may':5,'jun':6,'june':6,'jul':7,'july':7,'aug':8,'august':8,'sep':9,'sept':9,'september':9,
+    'oct':10,'october':10,'nov':11,'november':11,'dec':12,'december':12
+}
+
+def _parse_date_triplet(m):
+    d = int(m.group('d'))
+    mm = m.group('m')
+    y = int(m.group('y'))
+    if y < 100:  # 25 -> 2025 heuristic
+        y += 2000
+    if mm.isdigit():
+        month = int(mm)
+    else:
+        month = _MONTH_MAP.get(mm.lower(), 1)
+    try:
+        return datetime(y, month, d)
+    except Exception:
+        return None
+
+def ocr_extract_text(content: bytes, content_type: str) -> str:
+    """
+    Extract text from bytes using:
+      1) PDF text via PyPDF2 (if PDF)
+      2) Google Cloud Vision OCR (if set up)
+      3) Tesseract OCR (if available)
+    Returns a (possibly empty) string.
+    """
+    ct = (content_type or "").lower()
+
+    # PDFs: try direct text first (works for text-based PDFs)
+    if "pdf" in ct and _HAS_PYPDF2:
+        try:
+            reader = PdfReader(io.BytesIO(content))
+            texts = []
+            for page in reader.pages:
+                try:
+                    t = page.extract_text() or ""
+                    if t:
+                        texts.append(t)
+                except Exception:
+                    pass
+            merged = "\n".join(texts).strip()
+            if merged:
+                return merged
+        except Exception:
+            pass  # fall through to OCR if available
+
+    # Google Vision OCR
+    if _HAS_GCV and _GCV_READY:
+        try:
+            client = gcv.ImageAnnotatorClient()
+            gimg = gcv.Image(content=content)
+            resp = client.document_text_detection(image=gimg)
+            if resp and resp.full_text_annotation and resp.full_text_annotation.text:
+                return resp.full_text_annotation.text
+        except Exception:
+            pass
+
+    # Tesseract OCR for common image types (and as a last resort, a PDF first page image)
+    if _HAS_TESS:
+        try:
+            if os.environ.get("TESSERACT_CMD"):
+                pytesseract.pytesseract.tesseract_cmd = os.environ["TESSERACT_CMD"]
+            # Try to open as an image
+            img = Image.open(io.BytesIO(content))
+            txt = pytesseract.image_to_string(img)
+            if txt:
+                return txt
+        except Exception:
+            pass
+
+    # Nothing worked
+    return ""
+
+def parse_bill_text(txt: str) -> dict:
+    """
+    Parse a block of bill text into structured fields using line-level context.
+    Tries hard to avoid grabbing 'due date' or 'total account balance' by mistake.
+    """
+    import re
+    from datetime import datetime
+
+    def _clean_num(s: str) -> float:
+        s = s.replace(",", "").replace("$", "").replace("€", "").replace("£", "")
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+
+    def _to_cents(value: float, unit: str) -> float:
+        unit = (unit or "").strip()
+        if unit in ("$", "usd", "aud", "nz$", "£", "€"):
+            return value * 100.0
+        # treat c/¢ as cents
+        return value
+
+    # Normalise spacing
+    txt_norm = re.sub(r"[ \t]+", " ", txt)
+    lines = [ln.strip() for ln in txt_norm.splitlines() if ln.strip()]
+    lower = [ln.lower() for ln in lines]
+
+    result: dict = {}
+
+    # ---------- 1) Billing period ----------
+    # Prefer explicit markers like "Billing period", "For the period", "From ... to ..."
+    date_pat = re.compile(
+        r"(?P<d>\d{1,2})[\/\-\s](?P<m>\d{1,2}|[A-Za-z]{3,9})[\/\-\s](?P<y>\d{2,4})",
+        re.IGNORECASE,
+    )
+    month_map = {
+        'jan':1,'january':1,'feb':2,'february':2,'mar':3,'march':3,'apr':4,'april':4,
+        'may':5,'jun':6,'june':6,'jul':7,'july':7,'aug':8,'august':8,'sep':9,'sept':9,'september':9,
+        'oct':10,'october':10,'nov':11,'november':11,'dec':12,'december':12
+    }
+
+    def _parse_date(m):
+        d = int(m.group("d"))
+        mm = m.group("m")
+        y = int(m.group("y"))
+        if y < 100:
+            y += 2000
+        if mm.isdigit():
+            mo = int(mm)
+        else:
+            mo = month_map.get(mm.lower(), 1)
+        try:
+            return datetime(y, mo, d)
+        except Exception:
+            return None
+
+    period_found = False
+    for i, ln in enumerate(lower):
+        if any(k in ln for k in ("billing period", "for the period", "supply period", "usage period", "period from")):
+            m_all = list(date_pat.finditer(lines[i]))
+            if len(m_all) >= 2:
+                ds, de = _parse_date(m_all[0]), _parse_date(m_all[-1])
+                if ds and de and de >= ds:
+                    result["period_start"] = ds.date().isoformat()
+                    result["period_end"] = de.date().isoformat()
+                    period_found = True
+                    break
+        # "from ... to ..." on a single line
+        if " from " in ln and " to " in ln:
+            m_all = list(date_pat.finditer(lines[i]))
+            if len(m_all) >= 2:
+                ds, de = _parse_date(m_all[0]), _parse_date(m_all[-1])
+                if ds and de and de >= ds:
+                    result["period_start"] = ds.date().isoformat()
+                    result["period_end"] = de.date().isoformat()
+                    period_found = True
+                    break
+
+    if not period_found:
+        # Fallback: pick two dates that are close to each other on lines mentioning "period"
+        candidates = []
+        for i, ln in enumerate(lower):
+            if "period" in ln or "from" in ln or "to " in ln:
+                for m in date_pat.finditer(lines[i]):
+                    d = _parse_date(m)
+                    if d:
+                        candidates.append((i, d))
+        if len(candidates) >= 2:
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            ds = candidates[0][1]
+            de = max(candidates, key=lambda x: x[1])[1]
+            if ds and de and de >= ds:
+                result["period_start"] = ds.date().isoformat()
+                result["period_end"] = de.date().isoformat()
+
+    # ---------- 2) Total kWh for THIS bill ----------
+    # Prefer lines with "total usage", "electricity used", "this bill"
+    kwh_line_idx = None
+    for i, ln in enumerate(lower):
+        if any(k in ln for k in ("total usage", "electricity used", "usage this bill", "total kwh", "energy used")):
+            kwh_line_idx = i
+            break
+
+    kwh_pat = re.compile(r'(?<![\d\.])(?P<kwh>\d{1,6}(?:[,\d]{0,6})?(?:\.\d+)?)\s*kwh\b', re.IGNORECASE)
+    total_kwh = 0.0
+    if kwh_line_idx is not None:
+        m = kwh_pat.search(lines[kwh_line_idx])
+        if m:
+            total_kwh = _clean_num(m.group("kwh"))
+    if not total_kwh:
+        # fallback: max kWh anywhere (still constrained by the 'kwh' token)
+        m_all = [m for m in kwh_pat.finditer(txt)]
+        if m_all:
+            total_kwh = max(_clean_num(m.group("kwh")) for m in m_all)
+    if total_kwh:
+        result["total_kwh"] = total_kwh
+
+    # ---------- 3) Supply charge (per day) ----------
+    # Support cents or dollars per day, and various phrasings.
+    supply_pat = re.compile(
+        r'(supply|daily)\s+(charge|service|fixed).*?(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$)\s*\/?\s*(day|d)\b',
+        re.IGNORECASE
+    )
+    for i, ln in enumerate(lines):
+        m = supply_pat.search(ln)
+        if m:
+            cents = _to_cents(float(m.group("val")), m.group("unit"))
+            result["supply_cents_per_day"] = round(cents, 4)
+            break
+
+    # ---------- 4) Usage rates ----------
+    # Handle TOU (peak/shoulder/off-peak) and FLAT/anytime.
+    rate_any = r'(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$)\s*\/?\s*kwh'
+
+    tou_specs = [
+        ("usage_cents_per_kwh_peak", re.compile(r'peak[^.\n]*?' + rate_any, re.IGNORECASE)),
+        ("usage_cents_per_kwh_shoulder", re.compile(r'shoulder[^.\n]*?' + rate_any, re.IGNORECASE)),
+        ("usage_cents_per_kwh_offpeak", re.compile(r'(off-?peak|off peak)[^.\n]*?' + rate_any, re.IGNORECASE)),
+    ]
+    found_tou = False
+    for key, pat in tou_specs:
+        for ln in lines:
+            m = pat.search(ln)
+            if m:
+                val = _to_cents(float(m.group("val")), m.group("unit"))
+                result[key] = round(val, 4)
+                found_tou = True
+                break
+
+    if found_tou:
+        result["tariff_type"] = "TOU"
+    else:
+        # Flat / single / anytime
+        flat_pats = [
+            re.compile(r'(anytime|single\s*rate|general|usage|energy)[^.\n]*?' + rate_any, re.IGNORECASE),
+            re.compile(r'(?<!peak)(?<!off)[^.\n]*?' + rate_any, re.IGNORECASE),  # last resort
+        ]
+        for pat in flat_pats:
+            for ln in lines:
+                m = pat.search(ln)
+                if m:
+                    val = _to_cents(float(m.group("val")), m.group("unit"))
+                    result["tariff_type"] = "FLAT"
+                    result["usage_cents_per_kwh"] = round(val, 4)
+                    break
+            if "usage_cents_per_kwh" in result:
+                break
+
+    # ---------- 5) Total cost for the bill (incl. GST) ----------
+    # Prefer lines with "current charges", "total for this bill", "electricity charges".
+    money_pat = re.compile(r'(\$?\s*\d{1,6}(?:,\d{3})*(?:\.\d{2})?)')
+    preferred_cost_keys = ("current charges", "total for this bill", "electricity charges", "charges this bill", "amount due")
+    amounts = []
+    for i, ln in enumerate(lower):
+        if any(k in ln for k in preferred_cost_keys):
+            for m in money_pat.finditer(lines[i]):
+                amt = _clean_num(m.group(1))
+                if amt > 0:
+                    amounts.append((i, amt))
+    if amounts:
+        # Take the LARGEST amount among preferred lines (often the 'total this bill')
+        best = max(amounts, key=lambda x: x[1])[1]
+        result["total_cost_inc_gst"] = round(best, 2)
+    else:
+        # fallback: largest money amount anywhere (may be wrong, but better than nothing)
+        all_amts = [ _clean_num(m.group(1)) for m in money_pat.finditer(txt) ]
+        if all_amts:
+            result["total_cost_inc_gst"] = round(max(all_amts), 2)
+
+    # ---------- 6) Derive daily_kwh if possible ----------
+    if "total_kwh" in result and "period_start" in result and "period_end" in result:
+        try:
+            ds = datetime.fromisoformat(result["period_start"])
+            de = datetime.fromisoformat(result["period_end"])
+            days = max((de - ds).days, 1)
+            result["daily_kwh"] = round(float(result["total_kwh"]) / days, 2)
+        except Exception:
+            pass
+
+    return result
+
+def parse_bill_bytes(content: bytes, content_type: str) -> dict:
+    """
+    Extract text (PDF or image) and parse structured values.
+    Falls back to demo defaults if we can’t extract anything.
+    """
+    txt = ocr_extract_text(content, content_type)
+    parsed = parse_bill_text(txt) if txt else {}
+
+    if parsed:
+        # Provide conservative fill-ins
+        parsed.setdefault("tariff_type", "FLAT")
+        return parsed
+
+    # Fallback demo (so pipeline keeps working)
+    return {
+        "period_start": "2025-06-01",
+        "period_end": "2025-08-01",
+        "total_kwh": 1200,
+        "daily_kwh": round(1200 / 62, 2),
+        "supply_cents_per_day": 110,
+        "usage_cents_per_kwh_peak": 40,
+        "usage_cents_per_kwh_shoulder": 28,
+        "usage_cents_per_kwh_offpeak": 22,
+        "tariff_type": "TOU",
+        "distributor": "Unknown",
+        "total_cost_inc_gst": 540.00
+    }
 
 def _build_digest_html(phone: str) -> str:
-    """Builds a simple weekly digest HTML from what we’ve saved in Redis."""
+    """Build a simple weekly digest HTML from Redis."""
     k_bills = f"user:{phone}:bills"
     entries = r.lrange(k_bills, 0, -1) or []
     total_bills = len(entries)
 
-    # Pull last 5 as a preview list
     preview = []
     for raw in entries[-5:]:
         try:
@@ -139,7 +474,6 @@ def _build_digest_html(phone: str) -> str:
         mtype = (j.get("media_type") or "").split("/")[-1].upper()
         preview.append(f"<li>{when} — {mtype or 'UNKNOWN'}</li>")
 
-    # Optional savings param for demo
     savings = request.args.get("savings", "100")
     try:
         savings_val = float(savings)
@@ -202,51 +536,21 @@ def _build_digest_html(phone: str) -> str:
 """
     return html
 
-
 # ---- Tariff fetcher (stub) ----
 def fetch_tariffs_vic():
-    """
-    TODO: Swap with live data later (VIC source).
-    Return a few sample plans to compare against.
-    All cents values include GST for simplicity.
-    """
     return [
-        {
-            "name": "Flat Saver",
-            "tariff_type": "FLAT",
-            "supply_cents_per_day": 105,
-            "usage_cents_per_kwh": 32
-        },
-        {
-            "name": "TOU Value",
-            "tariff_type": "TOU",
-            "supply_cents_per_day": 95,
-            "peak_cents": 42,
-            "shoulder_cents": 28,
-            "offpeak_cents": 20
-        },
-        {
-            "name": "Daily Low",
-            "tariff_type": "FLAT",
-            "supply_cents_per_day": 80,
-            "usage_cents_per_kwh": 36
-        }
+        {"name": "Flat Saver", "tariff_type": "FLAT", "supply_cents_per_day": 105, "usage_cents_per_kwh": 32},
+        {"name": "TOU Value",  "tariff_type": "TOU",  "supply_cents_per_day": 95,  "peak_cents": 42, "shoulder_cents": 28, "offpeak_cents": 20},
+        {"name": "Daily Low",  "tariff_type": "FLAT", "supply_cents_per_day": 80,  "usage_cents_per_kwh": 36},
     ]
 
-
 def estimate_annual_cost(profile: dict, plan: dict) -> float:
-    """
-    Very rough estimate. Improve once we parse TOU shares from bills.
-    """
-    # Infer annual kWh from bill period if total_kwh provided
     total_kwh = float(profile.get("total_kwh") or 0)
     start = profile.get("period_start")
     end = profile.get("period_end")
 
-    # Default to 365 days and scale up
-    days = 62  # if we can’t parse exact days, assume 2 months
+    days = 62
     try:
-        from datetime import datetime
         if start and end:
             ds = datetime.fromisoformat(start)
             de = datetime.fromisoformat(end)
@@ -258,17 +562,14 @@ def estimate_annual_cost(profile: dict, plan: dict) -> float:
     if daily_kwh is None and total_kwh:
         daily_kwh = total_kwh / days
     if daily_kwh is None:
-        daily_kwh = 10  # fallback guess
+        daily_kwh = 10
 
     annual_kwh = daily_kwh * 365
-
-    # Supply charge
     supply_cents = float(plan.get("supply_cents_per_day") or 0) * 365
 
     if plan.get("tariff_type") == "FLAT":
         usage_cents = annual_kwh * float(plan.get("usage_cents_per_kwh") or 0)
     else:
-        # crude split until we have real TOU breakdowns
         peak = 0.5 * annual_kwh
         shoulder = 0.3 * annual_kwh
         offpeak = 0.2 * annual_kwh
@@ -279,18 +580,12 @@ def estimate_annual_cost(profile: dict, plan: dict) -> float:
         )
 
     total_cents = supply_cents + usage_cents
-    return round(total_cents / 100.0, 2)  # dollars
-
+    return round(total_cents / 100.0, 2)
 
 def compare_and_store(phone: str) -> dict:
-    """
-    Load the user’s latest parsed bill (or aggregate of bills),
-    compute best plan, store a snapshot, and return it.
-    """
     k_bills = f"user:{phone}:bills"
     raw_entries = r.lrange(k_bills, 0, -1) or []
 
-    # Use the last bill that has a parsed profile if present; otherwise synthesize a basic profile
     latest_profile = None
     for raw in reversed(raw_entries):
         try:
@@ -304,7 +599,6 @@ def compare_and_store(phone: str) -> dict:
             pass
 
     if not latest_profile:
-        # Fallback profile so the pipeline runs (replace once parsing is in)
         latest_profile = {
             "total_kwh": 1200,
             "period_start": "2025-06-01",
@@ -313,15 +607,10 @@ def compare_and_store(phone: str) -> dict:
         }
 
     plans = fetch_tariffs_vic()
-    scored = []
-    for p in plans:
-        cost = estimate_annual_cost(latest_profile, p)
-        scored.append({"plan": p, "annual_cost": cost})
+    scored = [{"plan": p, "annual_cost": estimate_annual_cost(latest_profile, p)} for p in plans]
     scored.sort(key=lambda x: x["annual_cost"])
 
     best = scored[0]
-    worst = scored[-1]
-    # “Current” cost guess: use median as a softer baseline
     median_cost = scored[len(scored)//2]["annual_cost"]
     savings = round(median_cost - best["annual_cost"], 2)
 
@@ -333,10 +622,8 @@ def compare_and_store(phone: str) -> dict:
         "baseline_cost": median_cost,
         "projected_savings": savings
     }
-
     r.set(f"user:{phone}:last_comparison", json.dumps(snapshot))
     return snapshot
-
 
 # -----------------------------
 # Health & diagnostics
@@ -344,7 +631,6 @@ def compare_and_store(phone: str) -> dict:
 @app.route("/health", methods=["GET"])
 def health():
     return "ok", 200
-
 
 @app.route("/redis_diag", methods=["GET"])
 def redis_diag():
@@ -366,7 +652,6 @@ def redis_diag():
             "has_url": bool(UPSTASH_URL),
         }, 500
 
-
 # -----------------------------
 # Simple session smoke tests
 # -----------------------------
@@ -375,14 +660,12 @@ def set_session():
     r.set("test_key", "Hello from Redis!")
     return "Session set!", 200
 
-
 @app.route("/get_session", methods=["GET"])
 def get_session():
     value = r.get("test_key")
     if isinstance(value, bytes):
         value = value.decode("utf-8", errors="ignore")
     return f"Value from Redis: {value}", 200
-
 
 # -----------------------------
 # Weekly digest (HTML)
@@ -392,20 +675,16 @@ def digest_preview():
     phone = request.args.get("phone", "").strip()
     if not phone:
         return "Missing ?phone=E164 (e.g., ?phone=%2B6145...)", 400
-    # Ensure it’s normalized like our keys
     phone = e164(phone)
     html = _build_digest_html(phone)
     return Response(html, mimetype="text/html")
 
-
-# Backward-compat: /digest -> /digest_preview
 @app.route("/digest", methods=["GET"])
 def digest_redirect():
     phone = request.args.get("phone", "")
     if not phone:
         return redirect("/digest_preview")
     return redirect(f"/digest_preview?phone={quote(phone, safe='')}")
-
 
 # -----------------------------
 # WhatsApp webhook
@@ -442,7 +721,6 @@ def whatsapp_webhook():
 
     # --- Intents ---
 
-    # Start
     if said_any("hi", "hello", "start"):
         r.set(k_state, "collecting")
         msg.body(
@@ -456,7 +734,6 @@ def whatsapp_webhook():
         )
         return str(resp)
 
-    # Share digest link on demand
     if said_any("digest", "show digest", "weekly digest"):
         if not PUBLIC_BASE_URL:
             msg.body("Digest preview is not available yet (missing PUBLIC_BASE_URL).")
@@ -465,12 +742,10 @@ def whatsapp_webhook():
         msg.body(f"Here’s your digest preview:\n{digest_url}")
         return str(resp)
 
-    # Finish
     if said_any("that's all", "thats all", "done", "finish", "finished", "all done"):
         r.set(k_state, "done")
         count = int(r.get(k_count) or 0)
 
-        # Run comparison now and stash snapshot; include savings in the reply
         cmp = compare_and_store(phone)
         savings = cmp.get("projected_savings", 0.0)
 
@@ -490,7 +765,6 @@ def whatsapp_webhook():
             )
         return str(resp)
 
-    # List bills
     if said_any("list bills", "show bills", "what have you saved"):
         entries = r.lrange(k_bills, -10, -1) or []
         if not entries:
@@ -513,18 +787,16 @@ def whatsapp_webhook():
         msg.body("Recent saved bills:\n" + "\n".join(lines))
         return str(resp)
 
-    # Add another
     if said_any("add another bill", "add another", "another bill", "add more", "upload another"):
         r.set(k_state, "collecting")
         msg.body("Cool — send the next bill photo/PDF. When finished, say “that's all”.")
         return str(resp)
 
-    # Media handling (Twilio sends MediaUrl0/MediaContentType0 when files attached)
+    # Media handling
     media_url = request.values.get("MediaUrl0")
     media_type = request.values.get("MediaContentType0")
 
     if state == "collecting" and media_url:
-        # Try to fetch the media from Twilio (auth required)
         downloaded_ok = False
         size_bytes = None
         fetched_type = None
@@ -533,13 +805,20 @@ def whatsapp_webhook():
         try:
             content, fetched_type, size_bytes = download_twilio_media(media_url)
             downloaded_ok = True
-            # Parse the bill content into a structured profile (stub for now)
             parsed = parse_bill_bytes(content, fetched_type or (media_type or ""))
+# Save a short OCR excerpt for debugging
+try:
+    ocr_text = ocr_extract_text(content, fetched_type or (media_type or ""))
+    if ocr_text:
+        entry["ocr_excerpt"] = ocr_text[:2000]  # keep it small
+except Exception:
+    pass
+
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
 
         entry = {
-            "media_url": media_url,                 # Twilio temp URL (expires)
+            "media_url": media_url,
             "media_type": media_type or fetched_type or "",
             "ts": int(time.time()),
             "downloaded_ok": downloaded_ok,
@@ -584,7 +863,6 @@ def whatsapp_webhook():
             "Or say 'that's all' when you’re finished."
         )
     elif state == "done":
-        # Nudge digest link if we can
         if PUBLIC_BASE_URL:
             digest_url = f"{PUBLIC_BASE_URL}/digest_preview?phone={quote(phone, safe='')}"
             msg.body(f"You’re done for now 🎉\nPreview your digest any time: {digest_url}\nSay 'hi' to add more bills.")
@@ -594,17 +872,11 @@ def whatsapp_webhook():
         msg.body("Say 'hi' to get started with your bill upload.")
     return str(resp)
 
-
 # -----------------------------
-# Admin/testing: list & last bill
+# Admin/testing
 # -----------------------------
 @app.route("/user_bills", methods=["GET"])
 def user_bills():
-    """
-    Admin helper:
-      GET /user_bills?phone=%2B61XXXXXXXXX
-    Returns JSON of saved bill entries for that phone.
-    """
     phone = e164(request.args.get("phone", ""))
     if not phone:
         return {"error": "Missing ?phone=E164 (encode + as %2B)"}, 400
@@ -620,10 +892,8 @@ def user_bills():
             parsed.append({"raw": str(e)})
     return {"phone": phone, "count": len(parsed), "bills": parsed}, 200
 
-
 @app.route("/last_bill", methods=["GET"])
 def last_bill():
-    """Quick debug: /last_bill?phone=%2B61XXXXXXXXX -> shows last saved bill entry."""
     phone = e164(request.args.get("phone", ""))
     if not phone:
         return {"error": "Missing ?phone=E164 (encode + as %2B)"}, 400
@@ -637,7 +907,6 @@ def last_bill():
         return {"phone": phone, "last_bill": json.loads(last)}, 200
     except Exception:
         return {"phone": phone, "last_bill": {"raw": str(last)}}, 200
-
 
 # -----------------------------
 # Entrypoint (local dev)
