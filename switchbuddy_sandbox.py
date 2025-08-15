@@ -62,7 +62,20 @@ def get_session():
 @app.route("/whatsapp/webhook", methods=["POST"])
 def whatsapp_webhook():
     from_number = (request.values.get("From") or "").replace("whatsapp:", "")
-    incoming_msg = (request.values.get("Body") or "").strip().lower()
+
+    # --- Normalize incoming text ---
+    raw = (request.values.get("Body") or "").strip()
+    # unify common unicode punctuation/whitespace to ASCII
+    normalized = (
+        raw.replace("\u2019", "'")   # curly apostrophe -> '
+           .replace("\u2018", "'")   # left single quote -> '
+           .replace("\u201C", '"')   # left double quote -> "
+           .replace("\u201D", '"')   # right double quote -> "
+           .replace("\u2013", "-")   # en dash -> -
+           .replace("\u2014", "-")   # em dash -> -
+    )
+    # collapse internal whitespace and lowercase
+    incoming_msg = " ".join(normalized.split()).lower().strip(" .!?,;:'\"-")
 
     # Keys per user
     k_state = f"user:{from_number}:state"     # idle|collecting|done
@@ -80,8 +93,12 @@ def whatsapp_webhook():
     resp = MessagingResponse()
     msg = resp.message()
 
-    # --- Simple intent handling ---
-    if incoming_msg in ("hi", "hello", "start"):
+    # Helpers for intent checks
+    def said_any(*phrases):
+        return any(p in incoming_msg for p in phrases)
+
+    # --- Intents ---
+    if said_any("hi", "hello", "start"):
         r.set(k_state, "collecting")
         msg.body(
             "Hi! I’m SwitchBuddy ⚡️\n\n"
@@ -92,8 +109,7 @@ def whatsapp_webhook():
         )
         return str(resp)
 
-    # mark “done”
-    if "that's all" in incoming_msg or "thats all" in incoming_msg or incoming_msg == "done":
+    if said_any("that's all", "thats all", "done", "finish", "finished", "all done"):
         r.set(k_state, "done")
         count = int(r.get(k_count) or 0)
         msg.body(
@@ -103,18 +119,17 @@ def whatsapp_webhook():
         )
         return str(resp)
 
-    # user wants to add another
-    if "add another" in incoming_msg:
+    if said_any("add another bill", "add another", "another bill", "add more", "upload another"):
         r.set(k_state, "collecting")
         msg.body("Cool — send the next bill photo/PDF. When finished, say “that's all”.")
         return str(resp)
 
-    # crude “bill received” detector (Twilio sends MediaUrl0 when an image/pdf is attached)
+    # Media?
     media_url = request.values.get("MediaUrl0")
     media_type = request.values.get("MediaContentType0")
 
     if state == "collecting" and media_url:
-        # (Sandbox) We just count it; real system would download → extract → parse.
+        # (Sandbox) just count it; prod would download+parse
         new_count = bill_count + 1
         r.set(k_count, new_count)
         msg.body(
@@ -123,7 +138,7 @@ def whatsapp_webhook():
         )
         return str(resp)
 
-    # Fallbacks based on state
+    # Fallbacks
     if state == "collecting":
         msg.body(
             "I’m ready — please send a photo/PDF of your bill.\n"
@@ -133,6 +148,7 @@ def whatsapp_webhook():
         msg.body("You’re done for now 🎉 Say 'hi' if you want to add more bills.")
     else:
         msg.body("Say 'hi' to get started with your bill upload.")
+
     return str(resp)
 
 
