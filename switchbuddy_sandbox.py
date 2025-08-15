@@ -3,12 +3,10 @@ from twilio.twiml.messaging_response import MessagingResponse
 import os
 from upstash_redis import Redis
 
-# Load env vars (recommended so we don't hardcode secrets)
-REDIS_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "https://whole-trout-5713.upstash.io")
-REDIS_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "ARZRAAImcDE4ODNlOTI3ZTgwNTg0MWVkODhmMmI0Njg3NDZhYzMwNnAxNTcxMw")
-
-# Connect to Upstash Redis
-r = Redis(url=REDIS_URL, token=REDIS_TOKEN)
+redis = Redis(
+    url=os.environ.get("UPSTASH_URL"),
+    token=os.environ.get("UPSTASH_TOKEN")
+)
 
 app = Flask(__name__)
 
