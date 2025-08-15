@@ -4,7 +4,9 @@ import os
 import time
 import json
 import requests
-from flask import Flask, request, Response
+from urllib.parse import quote
+
+from flask import Flask, request, Response, redirect
 from twilio.twiml.messaging_response import MessagingResponse
 from upstash_redis import Redis
 
@@ -19,18 +21,17 @@ if not UPSTASH_URL or not UPSTASH_TOKEN:
 # Use `r` consistently
 r = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
 
+# Your public base URL (e.g., https://switchbuddy-sandbox.onrender.com)
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+
 # -----------------------------
-# Flask app (define BEFORE any @app.route)
+# Flask app
 # -----------------------------
 app = Flask(__name__)
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def _base_url():
-    # Prefer explicit config, otherwise infer from request
-    return os.environ.get("PUBLIC_BASE_URL") or (request.url_root.rstrip("/"))
-
 def e164(raw: str) -> str:
     """
     Normalize a phone for Redis keys:
@@ -49,7 +50,7 @@ def e164(raw: str) -> str:
     return s
 
 def _normalize_text(s: str) -> str:
-    """Normalize curly quotes, dashes, excess whitespace, and strip punctuation."""
+    """Normalize curly quotes, dashes, collapse whitespace, lowercase, strip punct."""
     if not s:
         return ""
     normalized = (
@@ -93,51 +94,6 @@ def download_twilio_media(media_url: str, timeout=15):
 
     return content, content_type, (content_length if content_length is not None else len(content))
 
-# -----------------------------
-# Health & diagnostics
-# -----------------------------
-@app.route("/health", methods=["GET"])
-def health():
-    return "ok", 200
-
-@app.route("/redis_diag", methods=["GET"])
-def redis_diag():
-    try:
-        pong = r.ping()
-        return {
-            "connected": True,
-            "error": None,
-            "has_token": bool(UPSTASH_TOKEN),
-            "has_url": bool(UPSTASH_URL),
-            "ping": pong,
-            "url_prefix": (UPSTASH_URL or "")[: (UPSTASH_URL.find(".upstash.io") + 12)] if UPSTASH_URL else ""
-        }, 200
-    except Exception as e:
-        return {
-            "connected": False,
-            "error": f"{type(e).__name__}: {e}",
-            "has_token": bool(UPSTASH_TOKEN),
-            "has_url": bool(UPSTASH_URL),
-        }, 500
-
-# -----------------------------
-# Simple session smoke tests
-# -----------------------------
-@app.route("/set_session", methods=["GET"])
-def set_session():
-    r.set("test_key", "Hello from Redis!")
-    return "Session set!", 200
-
-@app.route("/get_session", methods=["GET"])
-def get_session():
-    value = r.get("test_key")
-    if isinstance(value, bytes):
-        value = value.decode("utf-8", errors="ignore")
-    return f"Value from Redis: {value}", 200
-
-# -----------------------------
-# Digest (HTML) — helper + route
-# -----------------------------
 def _build_digest_html(phone: str) -> str:
     """Builds a simple weekly digest HTML from what we’ve saved in Redis."""
     k_bills = f"user:{phone}:bills"
@@ -220,19 +176,68 @@ def _build_digest_html(phone: str) -> str:
 """
     return html
 
-@app.route("/digest", methods=["GET"])
-def digest():
-    """
-    Preview the weekly digest in the browser.
-    Usage:
-      /digest?phone=+61457344494
-      /digest?phone=+61457344494&savings=150
-    """
+# -----------------------------
+# Health & diagnostics
+# -----------------------------
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok", 200
+
+@app.route("/redis_diag", methods=["GET"])
+def redis_diag():
+    try:
+        pong = r.ping()
+        return {
+            "connected": True,
+            "error": None,
+            "has_token": bool(UPSTASH_TOKEN),
+            "has_url": bool(UPSTASH_URL),
+            "ping": pong,
+            "url_prefix": (UPSTASH_URL or "")[: (UPSTASH_URL.find(".upstash.io") + 12)] if UPSTASH_URL else ""
+        }, 200
+    except Exception as e:
+        return {
+            "connected": False,
+            "error": f"{type(e).__name__}: {e}",
+            "has_token": bool(UPSTASH_TOKEN),
+            "has_url": bool(UPSTASH_URL),
+        }, 500
+
+# -----------------------------
+# Simple session smoke tests
+# -----------------------------
+@app.route("/set_session", methods=["GET"])
+def set_session():
+    r.set("test_key", "Hello from Redis!")
+    return "Session set!", 200
+
+@app.route("/get_session", methods=["GET"])
+def get_session():
+    value = r.get("test_key")
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="ignore")
+    return f"Value from Redis: {value}", 200
+
+# -----------------------------
+# Weekly digest (HTML)
+# -----------------------------
+@app.route("/digest_preview", methods=["GET"])
+def digest_preview():
     phone = request.args.get("phone", "").strip()
     if not phone:
-        return {"error": "Missing ?phone=+61XXXXXXXXX"}, 400
+        return "Missing ?phone=E164 (e.g., ?phone=%2B6145...)", 400
+    # Ensure it’s normalized like our keys
+    phone = e164(phone)
     html = _build_digest_html(phone)
     return Response(html, mimetype="text/html")
+
+# Backward-compat: /digest -> /digest_preview
+@app.route("/digest", methods=["GET"])
+def digest_redirect():
+    phone = request.args.get("phone", "")
+    if not phone:
+        return redirect("/digest_preview")
+    return redirect(f"/digest_preview?phone={quote(phone, safe='')}")
 
 # -----------------------------
 # WhatsApp webhook
@@ -267,6 +272,8 @@ def whatsapp_webhook():
     def said_any(*phrases) -> bool:
         return any(p in incoming_msg for p in phrases)
 
+    # --- Intents ---
+
     # Start
     if said_any("hi", "hello", "start"):
         r.set(k_state, "collecting")
@@ -276,30 +283,40 @@ def whatsapp_webhook():
             "When you’re finished:\n"
             "• Reply: 'add another bill' to upload more\n"
             "• Reply: 'that's all' to finish\n"
-            "• Reply: 'list bills' to see what I’ve saved"
+            "• Reply: 'list bills' to see what I’ve saved\n"
+            "• Reply: 'digest' to get your weekly digest link"
         )
         return str(resp)
 
-       # Finish
+    # Share digest link on demand
+    if said_any("digest", "show digest", "weekly digest"):
+        if not PUBLIC_BASE_URL:
+            msg.body("Digest preview is not available yet (missing PUBLIC_BASE_URL).")
+            return str(resp)
+        digest_url = f"{PUBLIC_BASE_URL}/digest_preview?phone={quote(phone, safe='')}"
+        msg.body(f"Here’s your digest preview:\n{digest_url}")
+        return str(resp)
+
+    # Finish
     if said_any("that's all", "thats all", "done", "finish", "finished", "all done"):
         r.set(k_state, "done")
         count = int(r.get(k_count) or 0)
-        digest_link = f"{_base_url()}/digest?phone={phone}"
-        preview_link = f"{_base_url()}/digest_preview?phone={phone.replace('+', '%2B')}"
-        msg.body(
-            f"All set! I’ve saved {count} bill(s).\n"
-            f"Your weekly digest: {digest_link}\n"
-            f"(Preview table for debugging: {preview_link})\n\n"
-            "If you want to add more later, just say 'hi'."
-        )
-        return str(resp)
 
-    # Send digest on demand
-    if said_any("send digest", "my digest", "show digest", "digest"):
-        digest_link = f"{_base_url()}/digest?phone={phone}"
-        msg.body(f"Here’s your digest: {digest_link}")
+        if PUBLIC_BASE_URL:
+            digest_url = f"{PUBLIC_BASE_URL}/digest_preview?phone={quote(phone, safe='')}"
+            msg.body(
+                f"All set! I’ve saved {count} bill(s).\n"
+                "I’ll crunch the numbers and include them in your weekly digest.\n\n"
+                f"Preview it here: {digest_url}\n\n"
+                "If you want to add more later, just say 'hi'."
+            )
+        else:
+            msg.body(
+                f"All set! I’ve saved {count} bill(s).\n"
+                "I’ll crunch the numbers and include them in your weekly digest. "
+                "If you want to add more later, just say 'hi'."
+            )
         return str(resp)
-
 
     # List bills
     if said_any("list bills", "show bills", "what have you saved"):
@@ -390,7 +407,12 @@ def whatsapp_webhook():
             "Or say 'that's all' when you’re finished."
         )
     elif state == "done":
-        msg.body("You’re done for now 🎉 Say 'hi' if you want to add more bills.")
+        # Nudge digest link if we can
+        if PUBLIC_BASE_URL:
+            digest_url = f"{PUBLIC_BASE_URL}/digest_preview?phone={quote(phone, safe='')}"
+            msg.body(f"You’re done for now 🎉\nPreview your digest any time: {digest_url}\nSay 'hi' to add more bills.")
+        else:
+            msg.body("You’re done for now 🎉 Say 'hi' if you want to add more bills.")
     else:
         msg.body("Say 'hi' to get started with your bill upload.")
     return str(resp)
@@ -435,129 +457,7 @@ def last_bill():
             last = last.decode("utf-8", errors="ignore")
         return {"phone": phone, "last_bill": json.loads(last)}, 200
     except Exception:
-        return {"phone": phone, "last_bill": {"raw": str(last)}}, 200@app.route("/clear_user", methods=["POST", "GET"])
-def clear_user():
-    """
-    Clears state for a phone (handy for testing).
-    Usage:
-      GET  /clear_user?phone=%2B6145...
-      POST /clear_user with form phone=%2B6145...
-    """
-    phone = e164(request.values.get("phone", ""))
-    if not phone:
-        return {"error": "Missing phone (E164). Encode + as %2B for GET."}, 400
-
-    keys = [
-        f"user:{phone}:state",
-        f"user:{phone}:bill_count",
-        f"user:{phone}:bills",
-    ]
-    deleted = 0
-    for k in keys:
-        try:
-            # For list, delete by key name; Upstash supports DEL
-            r.delete(k)
-            deleted += 1
-        except Exception:
-            pass
-    return {"phone": phone, "deleted_keys": deleted}, 200
-
-
-# -----------------------------
-# Weekly digest preview (HTML table)
-# -----------------------------
-@app.route("/digest_preview", methods=["GET"])
-def digest_preview():
-    phone = e164(request.args.get("phone", ""))
-    if not phone:
-        return "Missing ?phone=E164 (e.g., ?phone=%2B6145...)", 400
-
-    k_bills = f"user:{phone}:bills"
-
-    raw_entries = r.lrange(k_bills, 0, -1) or []
-    entries = []
-    for e in raw_entries:
-        try:
-            if isinstance(e, bytes):
-                e = e.decode("utf-8", errors="ignore")
-            entries.append(json.loads(e))
-        except Exception:
-            entries.append({"raw": str(e)})
-
-    saved_count = len(entries)
-
-    def fmt_size(b):
-        if not b:
-            return "—"
-        try:
-            b = int(b)
-        except Exception:
-            return str(b)
-        if b < 1024:
-            return f"{b} B"
-        if b < 1024*1024:
-            return f"{b/1024:.1f} KB"
-        return f"{b/1024/1024:.2f} MB"
-
-    rows = []
-    for i, item in enumerate(entries, start=1):
-        ts = item.get("ts")
-        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "—"
-        mtype = item.get("media_type", "—")
-        ok = "yes" if item.get("downloaded_ok") else "no"
-        err = item.get("download_err") or ""
-        size = fmt_size(item.get("download_size_bytes"))
-        rows.append(f"""
-          <tr>
-            <td style="padding:6px;border:1px solid #ddd;">{i}</td>
-            <td style="padding:6px;border:1px solid #ddd;">{when}</td>
-            <td style="padding:6px;border:1px solid #ddd;">{mtype}</td>
-            <td style="padding:6px;border:1px solid #ddd;">{size}</td>
-            <td style="padding:6px;border:1px solid #ddd;">{ok}</td>
-            <td style="padding:6px;border:1px solid #ddd;max-width:280px;word-wrap:break-word;">{err}</td>
-          </tr>
-        """)
-
-    table_html = (
-        "<p>No bills saved yet for this number.</p>"
-        if not rows else
-        f"""
-        <table style="border-collapse:collapse;border:1px solid #ddd;font-family:Arial,sans-serif;font-size:14px;">
-          <thead>
-            <tr style="background:#f7f7f7;">
-              <th style="padding:6px;border:1px solid #ddd;">#</th>
-              <th style="padding:6px;border:1px solid #ddd;">When</th>
-              <th style="padding:6px;border:1px solid #ddd;">Type</th>
-              <th style="padding:6px;border:1px solid #ddd;">Size</th>
-              <th style="padding:6px;border:1px solid #ddd;">Fetched</th>
-              <th style="padding:6px;border:1px solid #ddd;">Note</th>
-            </tr>
-          </thead>
-          <tbody>
-            {''.join(rows)}
-          </tbody>
-        </table>
-        """
-    )
-
-    html = f"""
-    <!doctype html>
-    <html>
-    <head>
-      <meta charset="utf-8" />
-      <title>SwitchBuddy – Weekly Digest Preview</title>
-    </head>
-    <body style="margin:24px;font-family:Arial,Helvetica,sans-serif;">
-      <h2>Weekly Digest Preview</h2>
-      <p><strong>Phone:</strong> {phone}</p>
-      <p><strong>Bills saved:</strong> {saved_count}</p>
-      {table_html}
-      <hr>
-      <p style="color:#666;">(Sandbox preview – data reflects your current uploads.)</p>
-    </body>
-    </html>
-    """
-    return html, 200
+        return {"phone": phone, "last_bill": {"raw": str(last)}}, 200
 
 # -----------------------------
 # Entrypoint (local dev)
