@@ -61,20 +61,80 @@ def get_session():
 
 @app.route("/whatsapp/webhook", methods=["POST"])
 def whatsapp_webhook():
-    incoming_msg = (request.values.get("Body") or "").lower()
+    from_number = (request.values.get("From") or "").replace("whatsapp:", "")
+    incoming_msg = (request.values.get("Body") or "").strip().lower()
+
+    # Keys per user
+    k_state = f"user:{from_number}:state"     # idle|collecting|done
+    k_count = f"user:{from_number}:bill_count"
+
+    # Init defaults if missing
+    if r.get(k_state) is None:
+        r.set(k_state, "idle")
+    if r.get(k_count) is None:
+        r.set(k_count, 0)
+
+    state = r.get(k_state)
+    bill_count = int(r.get(k_count) or 0)
+
     resp = MessagingResponse()
     msg = resp.message()
 
-    if "hi" in incoming_msg:
-        msg.body("Hi! I'm SwitchBuddy, please send me a photo of your electricity bill to get started on finding you a better deal on your utilities.")
-    elif "another" in incoming_msg:
-        msg.body("Okay, if you have another bill, please send me the next photo.")
-    elif "done" in incoming_msg or "that's all" in incoming_msg:
-        msg.body("Thanks! I’ll start comparing your plans now and send your weekly digest.")
-    else:
-        msg.body("Got it! (Sandbox: I’d process this bill now.)")
+    # --- Simple intent handling ---
+    if incoming_msg in ("hi", "hello", "start"):
+        r.set(k_state, "collecting")
+        msg.body(
+            "Hi! I’m SwitchBuddy ⚡️\n\n"
+            "Please send a photo or PDF of your electricity bill.\n\n"
+            "When you’re finished:\n"
+            "• Reply: 'add another bill' to upload more\n"
+            "• Reply: 'that's all' to finish"
+        )
+        return str(resp)
 
+    # mark “done”
+    if "that's all" in incoming_msg or "thats all" in incoming_msg or incoming_msg == "done":
+        r.set(k_state, "done")
+        count = int(r.get(k_count) or 0)
+        msg.body(
+            f"All set! I’ve saved {count} bill(s).\n"
+            "I’ll crunch the numbers and include them in your weekly digest. "
+            "If you want to add more later, just say 'hi'."
+        )
+        return str(resp)
+
+    # user wants to add another
+    if "add another" in incoming_msg:
+        r.set(k_state, "collecting")
+        msg.body("Cool — send the next bill photo/PDF. When finished, say “that's all”.")
+        return str(resp)
+
+    # crude “bill received” detector (Twilio sends MediaUrl0 when an image/pdf is attached)
+    media_url = request.values.get("MediaUrl0")
+    media_type = request.values.get("MediaContentType0")
+
+    if state == "collecting" and media_url:
+        # (Sandbox) We just count it; real system would download → extract → parse.
+        new_count = bill_count + 1
+        r.set(k_count, new_count)
+        msg.body(
+            f"Bill received ✅ (#{new_count}).\n\n"
+            "Reply 'add another bill' to add more, or 'that's all' to finish."
+        )
+        return str(resp)
+
+    # Fallbacks based on state
+    if state == "collecting":
+        msg.body(
+            "I’m ready — please send a photo/PDF of your bill.\n"
+            "Or say 'that's all' when you’re finished."
+        )
+    elif state == "done":
+        msg.body("You’re done for now 🎉 Say 'hi' if you want to add more bills.")
+    else:
+        msg.body("Say 'hi' to get started with your bill upload.")
     return str(resp)
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
