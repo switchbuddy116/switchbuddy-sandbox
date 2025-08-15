@@ -4,6 +4,10 @@ import os
 import time
 import json
 import requests
+import re
+import io
+import datetime
+from PyPDF2 import PdfReader
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from upstash_redis import Redis
@@ -83,6 +87,68 @@ def download_twilio_media(media_url: str, timeout=15):
         content = b"".join(chunks)
 
     return content, content_type, (content_length if content_length is not None else len(content))
+
+def _pdf_to_text(pdf_bytes: bytes) -> str:
+    """Extract text from a PDF (best-effort)."""
+    with io.BytesIO(pdf_bytes) as bio:
+        r = PdfReader(bio)
+        pages = []
+        for p in r.pages:
+            try:
+                pages.append(p.extract_text() or "")
+            except Exception:
+                pages.append("")
+        return "\n".join(pages)
+
+def _extract_bill_metrics_from_text(text: str) -> dict:
+    """
+    Heuristic scrapes for common bill fields:
+    - usage kWh
+    - total amount due ($)
+    - daily supply charge
+    - per-kWh rates (c/kWh)
+    """
+    metrics = {
+        "usage_kwh": None,
+        "total_amount": None,
+        "daily_supply": None,
+        "peak_rate_c_per_kwh": None,
+        "offpeak_rate_c_per_kwh": None,
+    }
+
+    t = text.lower()
+
+    # Usage e.g. "1234 kWh"
+    m = re.search(r'(\d{2,6})\s*kwh', t, re.I)
+    if m:
+        try:
+            metrics["usage_kwh"] = int(m.group(1))
+        except Exception:
+            pass
+
+    # Total due e.g. "Total due $123.45" or "Total amount $123.45"
+    m = re.search(r'total(?:\s+amount|\s+due|\s+bill)?\s*\$?\s*([0-9]+(?:\.[0-9]{2})?)', t, re.I)
+    if m:
+        metrics["total_amount"] = float(m.group(1))
+
+    # Daily supply e.g. "$1.01/day" or "110.00 c/day"
+    m = re.search(r'\$([0-9]+(?:\.[0-9]{2})?)\s*/\s*day', t, re.I)
+    if m:
+        metrics["daily_supply"] = f"${m.group(1)}/day"
+    else:
+        m = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*c\s*/\s*day', t, re.I)
+        if m:
+            metrics["daily_supply"] = f"{m.group(1)} c/day"
+
+    # Rates (grab first two as peak/off-peak if present)
+    rates = re.findall(r'([0-9]+(?:\.[0-9]+)?)\s*c\s*/?\s*kwh', t, re.I)
+    if rates:
+        metrics["peak_rate_c_per_kwh"] = float(rates[0])
+        if len(rates) > 1:
+            metrics["offpeak_rate_c_per_kwh"] = float(rates[1])
+
+    return metrics
+
 
 # -----------------------------
 # Simple session smoke tests
