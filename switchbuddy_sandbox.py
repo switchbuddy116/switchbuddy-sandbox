@@ -298,6 +298,85 @@ def last_bill():
     except Exception:
         return {"phone": phone, "last_bill": {"raw": last}}, 200
 
+import datetime
+
+def _humansize(nbytes: int) -> str:
+    if not isinstance(nbytes, int):
+        return "unknown"
+    for unit in ["B","KB","MB","GB"]:
+        if nbytes < 1024.0:
+            return f"{nbytes:.1f} {unit}"
+        nbytes /= 1024.0
+    return f"{nbytes:.1f} TB"
+
+def _humants(ts: int) -> str:
+    try:
+        return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "unknown"
+
+@app.route("/digest_preview", methods=["GET"])
+def digest_preview():
+    """
+    Quick HTML preview of what we'll include in the weekly digest.
+    Usage: /digest_preview?phone=%2B61XXXXXXXXX
+    """
+    phone = request.args.get("phone", "").strip()
+    if not phone:
+        return ("<h3>Missing ?phone= parameter. Example:</h3>"
+                "<code>/digest_preview?phone=%2B61457344494</code>", 400)
+
+    k_count = f"user:{phone}:bill_count"
+    k_bills = f"user:{phone}:bills"
+
+    count = int(r.get(k_count) or 0)
+    last_raw = r.lindex(k_bills, -1)
+    last = {}
+    if last_raw:
+        try:
+            last = json.loads(last_raw)
+        except Exception:
+            last = {"raw": str(last_raw)}
+
+    media_type = last.get("media_type", "unknown")
+    ts = _humants(last.get("ts", 0))
+    size = _humansize(int(last.get("download_size_bytes", 0) or 0))
+    fetched = "yes" if last.get("downloaded_ok") else "no"
+
+    html = f"""
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>SwitchBuddy – Digest Preview</title>
+        <style>
+          body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 24px; }}
+          .card {{ max-width: 640px; border: 1px solid #eee; border-radius: 12px; padding: 20px; }}
+          h1 {{ margin: 0 0 8px; }}
+          .muted {{ color: #666; }}
+          ul {{ line-height: 1.6; }}
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h1>Weekly Digest (Preview)</h1>
+          <div class="muted">for {phone}</div>
+          <hr />
+          <h3>Bill uploads</h3>
+          <ul>
+            <li><strong>Total bills saved:</strong> {count}</li>
+            <li><strong>Last bill uploaded:</strong> {ts}</li>
+            <li><strong>Last bill type:</strong> {media_type}</li>
+            <li><strong>Fetched from Twilio:</strong> {fetched}</li>
+            <li><strong>Last file size:</strong> {size}</li>
+          </ul>
+          <p class="muted">Next step: we’ll parse usage from PDFs/images and compute plan comparisons.</p>
+        </div>
+      </body>
+    </html>
+    """
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
 # -----------------------------
 # Entrypoint
 # -----------------------------
