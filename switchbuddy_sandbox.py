@@ -72,6 +72,7 @@ def e164(raw: str) -> str:
         s = "+" + s
     return s
 
+
 def _normalize_text(s: str) -> str:
     """Normalize curly quotes, dashes, collapse whitespace, lowercase, strip punct."""
     if not s:
@@ -86,6 +87,7 @@ def _normalize_text(s: str) -> str:
          .replace("\u2014", "-")
     )
     return " ".join(normalized.split()).lower().strip(" .!?,;:'\"-")
+
 
 def download_twilio_media(media_url: str, timeout=15):
     """
@@ -117,6 +119,7 @@ def download_twilio_media(media_url: str, timeout=15):
 
     return content, content_type, (content_length if content_length is not None else len(content))
 
+
 def _build_digest_html(phone: str) -> str:
     """Builds a simple weekly digest HTML from what we’ve saved in Redis."""
     k_bills = f"user:{phone}:bills"
@@ -140,7 +143,7 @@ def _build_digest_html(phone: str) -> str:
     savings = request.args.get("savings", "100")
     try:
         savings_val = float(savings)
-    except:
+    except Exception:
         savings_val = 100.0
 
     html = f"""
@@ -198,6 +201,7 @@ def _build_digest_html(phone: str) -> str:
 </html>
 """
     return html
+
 
 # ---- Tariff fetcher (stub) ----
 def fetch_tariffs_vic():
@@ -317,7 +321,7 @@ def compare_and_store(phone: str) -> dict:
 
     best = scored[0]
     worst = scored[-1]
-    # “Current” cost guess: use worst or flat mid—here we’ll use the median as a softer baseline
+    # “Current” cost guess: use median as a softer baseline
     median_cost = scored[len(scored)//2]["annual_cost"]
     savings = round(median_cost - best["annual_cost"], 2)
 
@@ -341,6 +345,7 @@ def compare_and_store(phone: str) -> dict:
 def health():
     return "ok", 200
 
+
 @app.route("/redis_diag", methods=["GET"])
 def redis_diag():
     try:
@@ -361,6 +366,7 @@ def redis_diag():
             "has_url": bool(UPSTASH_URL),
         }, 500
 
+
 # -----------------------------
 # Simple session smoke tests
 # -----------------------------
@@ -369,12 +375,14 @@ def set_session():
     r.set("test_key", "Hello from Redis!")
     return "Session set!", 200
 
+
 @app.route("/get_session", methods=["GET"])
 def get_session():
     value = r.get("test_key")
     if isinstance(value, bytes):
         value = value.decode("utf-8", errors="ignore")
     return f"Value from Redis: {value}", 200
+
 
 # -----------------------------
 # Weekly digest (HTML)
@@ -389,6 +397,7 @@ def digest_preview():
     html = _build_digest_html(phone)
     return Response(html, mimetype="text/html")
 
+
 # Backward-compat: /digest -> /digest_preview
 @app.route("/digest", methods=["GET"])
 def digest_redirect():
@@ -396,6 +405,7 @@ def digest_redirect():
     if not phone:
         return redirect("/digest_preview")
     return redirect(f"/digest_preview?phone={quote(phone, safe='')}")
+
 
 # -----------------------------
 # WhatsApp webhook
@@ -455,7 +465,7 @@ def whatsapp_webhook():
         msg.body(f"Here’s your digest preview:\n{digest_url}")
         return str(resp)
 
-        # Finish
+    # Finish
     if said_any("that's all", "thats all", "done", "finish", "finished", "all done"):
         r.set(k_state, "done")
         count = int(r.get(k_count) or 0)
@@ -479,7 +489,6 @@ def whatsapp_webhook():
                 "I’ll include this in your weekly digest. If you want to add more later, just say 'hi'."
             )
         return str(resp)
-
 
     # List bills
     if said_any("list bills", "show bills", "what have you saved"):
@@ -514,7 +523,7 @@ def whatsapp_webhook():
     media_url = request.values.get("MediaUrl0")
     media_type = request.values.get("MediaContentType0")
 
-       if state == "collecting" and media_url:
+    if state == "collecting" and media_url:
         # Try to fetch the media from Twilio (auth required)
         downloaded_ok = False
         size_bytes = None
@@ -611,6 +620,7 @@ def user_bills():
             parsed.append({"raw": str(e)})
     return {"phone": phone, "count": len(parsed), "bills": parsed}, 200
 
+
 @app.route("/last_bill", methods=["GET"])
 def last_bill():
     """Quick debug: /last_bill?phone=%2B61XXXXXXXXX -> shows last saved bill entry."""
@@ -627,6 +637,7 @@ def last_bill():
         return {"phone": phone, "last_bill": json.loads(last)}, 200
     except Exception:
         return {"phone": phone, "last_bill": {"raw": str(last)}}, 200
+
 
 # -----------------------------
 # Entrypoint (local dev)
