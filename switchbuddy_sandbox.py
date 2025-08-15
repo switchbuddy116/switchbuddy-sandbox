@@ -27,6 +27,10 @@ app = Flask(__name__)
 # -----------------------------
 # Helpers
 # -----------------------------
+def _base_url():
+    # Prefer explicit config, otherwise infer from request
+    return os.environ.get("PUBLIC_BASE_URL") or (request.url_root.rstrip("/"))
+
 def e164(raw: str) -> str:
     """
     Normalize a phone for Redis keys:
@@ -276,16 +280,26 @@ def whatsapp_webhook():
         )
         return str(resp)
 
-    # Finish
+       # Finish
     if said_any("that's all", "thats all", "done", "finish", "finished", "all done"):
         r.set(k_state, "done")
         count = int(r.get(k_count) or 0)
+        digest_link = f"{_base_url()}/digest?phone={phone}"
+        preview_link = f"{_base_url()}/digest_preview?phone={phone.replace('+', '%2B')}"
         msg.body(
             f"All set! I’ve saved {count} bill(s).\n"
-            "I’ll crunch the numbers and include them in your weekly digest. "
+            f"Your weekly digest: {digest_link}\n"
+            f"(Preview table for debugging: {preview_link})\n\n"
             "If you want to add more later, just say 'hi'."
         )
         return str(resp)
+
+    # Send digest on demand
+    if said_any("send digest", "my digest", "show digest", "digest"):
+        digest_link = f"{_base_url()}/digest?phone={phone}"
+        msg.body(f"Here’s your digest: {digest_link}")
+        return str(resp)
+
 
     # List bills
     if said_any("list bills", "show bills", "what have you saved"):
@@ -421,7 +435,33 @@ def last_bill():
             last = last.decode("utf-8", errors="ignore")
         return {"phone": phone, "last_bill": json.loads(last)}, 200
     except Exception:
-        return {"phone": phone, "last_bill": {"raw": str(last)}}, 200
+        return {"phone": phone, "last_bill": {"raw": str(last)}}, 200@app.route("/clear_user", methods=["POST", "GET"])
+def clear_user():
+    """
+    Clears state for a phone (handy for testing).
+    Usage:
+      GET  /clear_user?phone=%2B6145...
+      POST /clear_user with form phone=%2B6145...
+    """
+    phone = e164(request.values.get("phone", ""))
+    if not phone:
+        return {"error": "Missing phone (E164). Encode + as %2B for GET."}, 400
+
+    keys = [
+        f"user:{phone}:state",
+        f"user:{phone}:bill_count",
+        f"user:{phone}:bills",
+    ]
+    deleted = 0
+    for k in keys:
+        try:
+            # For list, delete by key name; Upstash supports DEL
+            r.delete(k)
+            deleted += 1
+        except Exception:
+            pass
+    return {"phone": phone, "deleted_keys": deleted}, 200
+
 
 # -----------------------------
 # Weekly digest preview (HTML table)
