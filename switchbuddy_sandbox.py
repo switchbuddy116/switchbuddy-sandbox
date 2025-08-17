@@ -703,8 +703,9 @@ def get_session():
 VERSION = "SBY-2025-08-17-parse2"
 
 @app.route("/version", methods=["GET"])
-def version():
+def svc_version():
     return {"version": VERSION}, 200
+
 
 
 # -----------------------------
