@@ -193,10 +193,9 @@ def ocr_extract_text(content: bytes, content_type: str) -> str:
 def parse_bill_text(txt: str) -> dict:
     """
     Parse a block of bill text into structured fields using line-level context.
-    Captures period, supply, total kWh, tiered Step 1/2 kWh + rates, and totals.
-    Robust 'kWh @ rate' pair extraction that tolerates line wraps.
+    Robust handling for tiered 'Step 1/Step 2' even when OCR inserts spaces,
+    plus kWh@rate pairs across line wraps. Prefers TIERED if any step markers appear.
     """
-    # Helpers
     def _clean_num(s: str) -> float:
         s = s.replace(",", "").replace("$", "").replace("€", "").replace("£", "")
         try:
@@ -208,12 +207,13 @@ def parse_bill_text(txt: str) -> dict:
         unit = (unit or "").strip()
         if unit in ("$", "usd", "aud", "nz$", "£", "€"):
             return value * 100.0  # dollars -> cents
-        return value  # already cents
+        return value
 
     # Normalise spacing
     txt_norm = re.sub(r"[ \t]+", " ", txt)
     lines = [ln.strip() for ln in txt_norm.splitlines() if ln.strip()]
     lower = [ln.lower() for ln in lines]
+    nospace_lower = [re.sub(r"\s+", "", ln).lower() for ln in lines]
 
     out: dict = {}
 
@@ -234,10 +234,7 @@ def parse_bill_text(txt: str) -> dict:
         y = int(m.group("y"))
         if y < 100:
             y += 2000
-        if mm.isdigit():
-            mo = int(mm)
-        else:
-            mo = month_map.get(mm.lower(), 1)
+        mo = int(mm) if mm.isdigit() else month_map.get(mm.lower(), 1)
         try:
             return datetime(y, mo, d)
         except Exception:
@@ -279,7 +276,12 @@ def parse_bill_text(txt: str) -> dict:
                 out["period_start"] = ds.date().isoformat()
                 out["period_end"] = de.date().isoformat()
 
-    # ---------- 2) Total kWh for THIS bill (generic) ----------
+    # ---------- 2) Detect if bill is tiered (OCR-safe) ----------
+    step1_idxs = [i for i, ns in enumerate(nospace_lower) if "step1" in ns]
+    step2_idxs = [i for i, ns in enumerate(nospace_lower) if "step2" in ns]
+    prefer_tier = bool(step1_idxs or step2_idxs)
+
+    # ---------- 3) Total kWh (generic headline) ----------
     kwh_token_pat = re.compile(r'(?<![\d\.])(?P<kwh>\d{1,6}(?:[,\d]{0,6})?(?:\.\d+)?)\s*kwh\b', re.IGNORECASE)
     total_kwh_val = None
     for i, ln in enumerate(lower):
@@ -288,14 +290,10 @@ def parse_bill_text(txt: str) -> dict:
             if m:
                 total_kwh_val = _clean_num(m.group("kwh"))
                 break
-    if total_kwh_val is None:
-        # fallback later to pair-sum if available
-
-        pass
-    else:
+    if total_kwh_val is not None:
         out["total_kwh"] = round(total_kwh_val, 3)
 
-    # ---------- 3) Supply charge (per day) ----------
+    # ---------- 4) Supply charge (per day) ----------
     supply_pat = re.compile(
         r'(supply|daily)\s+(charge|service|fixed).*?(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$)\s*\/?\s*(day|d)\b',
         re.IGNORECASE
@@ -307,25 +305,31 @@ def parse_bill_text(txt: str) -> dict:
             out["supply_cents_per_day"] = round(cents, 4)
             break
 
-    # ---------- 4) Tier pairs: <kwh> kWh @ <rate> (handle line wraps) ----------
+    # ---------- 5) Tier pairs & fallbacks ----------
+    # kWh @ rate pairs (inline or wrapped)
     pair_pat_inline = re.compile(
-        r'(?P<k>\d{1,6}(?:[,\d]{0,6})?(?:\.\d+)?)\s*kwh[^@\n]{0,40}(?:@|at|x)\s*(?P<r>\d{1,4}(?:\.\d+)?)\s*(?P<u>[c¢]|\$)\s*\/?\s*kwh',
+        r'(?P<k>\d{1,6}(?:[,\d]{0,6})?(?:\.\d+)?)\s*kwh[^@\n]{0,60}(?:@|at|x)\s*(?P<r>\d{1,4}(?:\.\d+)?)\s*(?P<u>[c¢]|\$)\s*\/?\s*kwh',
         re.IGNORECASE
     )
     kwh_only_pat  = re.compile(r'(?P<k>\d{1,6}(?:[,\d]{0,6})?(?:\.\d+)?)\s*kwh\b', re.IGNORECASE)
     rate_only_pat = re.compile(r'(?P<r>\d{1,4}(?:\.\d+)?)\s*(?P<u>[c¢]|\$)\s*\/?\s*kwh', re.IGNORECASE)
 
-    pairs = []  # list of (kwh, rate_cents)
+    def _window_blob(i: int, span: int = 3) -> str:
+        parts = []
+        for j in range(i - span, i + span + 1):
+            if 0 <= j < len(lines):
+                parts.append(lines[j])
+        return " ".join(parts)
 
-    # 4a) Same-line pairs
+    pairs = []
+    # same-line
     for ln in lines:
         for m in pair_pat_inline.finditer(ln):
             k = _clean_num(m.group("k"))
             r = _to_cents(_clean_num(m.group("r")), m.group("u"))
             if k > 0 and r > 0:
                 pairs.append((k, r))
-
-    # 4b) Wrapped pairs: line i has kWh, line i+1 has rate (or vice versa)
+    # wrapped (adjacent)
     for i in range(len(lines) - 1):
         blob = lines[i] + " " + lines[i+1]
         m_inline = pair_pat_inline.search(blob)
@@ -334,49 +338,86 @@ def parse_bill_text(txt: str) -> dict:
             r = _to_cents(_clean_num(m_inline.group("r")), m_inline.group("u"))
             if k > 0 and r > 0:
                 pairs.append((k, r))
-                continue  # already captured as an inline pair
+                continue
+        mk = kwh_only_pat.search(lines[i]);   mr = rate_only_pat.search(lines[i+1])
+        mk2 = kwh_only_pat.search(lines[i+1]); mr2 = rate_only_pat.search(lines[i])
+        for (km, rm) in ((mk, mr), (mk2, mr2)):
+            if km and rm:
+                k = _clean_num(km.group("k"))
+                r = _to_cents(_clean_num(rm.group("r")), rm.group("u"))
+                if k > 0 and r > 0:
+                    pairs.append((k, r))
 
-        mk = kwh_only_pat.search(lines[i])
-        mr = rate_only_pat.search(lines[i+1])
-        if mk and mr:
-            k = _clean_num(mk.group("k"))
-            r = _to_cents(_clean_num(mr.group("r")), mr.group("u"))
-            if k > 0 and r > 0:
-                pairs.append((k, r))
-            continue
-
-        mk2 = kwh_only_pat.search(lines[i+1])
-        mr2 = rate_only_pat.search(lines[i])
-        if mk2 and mr2:
-            k = _clean_num(mk2.group("k"))
-            r = _to_cents(_clean_num(mr2.group("r")), mr2.group("u"))
-            if k > 0 and r > 0:
-                pairs.append((k, r))
-
-    # Deduplicate near-identical pairs (rare, but PDFs can duplicate text)
+    # de-dup
     deduped = []
     for k, r in pairs:
         if not any(abs(k - k2) < 0.01 and abs(r - r2) < 0.01 for (k2, r2) in deduped):
             deduped.append((k, r))
     pairs = deduped
 
-    # If we have pairs, it's TIERED. Map in order: step1, step2, ...
-    if pairs:
+    # If we see explicit step markers, prefer TIERED no matter what
+    if prefer_tier:
         out["tariff_type"] = "TIERED"
+
+    # Map pairs in order to steps
+    if pairs:
+        if "tariff_type" not in out:
+            out["tariff_type"] = "TIERED"
         if len(pairs) >= 1:
             out["step1_kwh"] = round(pairs[0][0], 3)
             out["usage_cents_per_kwh_step1"] = round(pairs[0][1], 3)
         if len(pairs) >= 2:
             out["step2_kwh"] = round(pairs[1][0], 3)
             out["usage_cents_per_kwh_step2"] = round(pairs[1][1], 3)
-
-        # Prefer explicit total; otherwise sum pairs
+        # If no explicit total_kwh or pair-sum looks more complete, use pair sum
         pair_sum = round(sum(k for k, _ in pairs), 3)
         if "total_kwh" not in out or pair_sum > float(out["total_kwh"]) + 0.5:
             out["total_kwh"] = pair_sum
 
-    # ---------- 5) TOU/FLAT fallback if we didn't detect pairs ----------
-    if out.get("tariff_type") != "TIERED":
+    # Per-step nearest fallback if we have markers but missed one side (kWh or rate)
+    def _nearest_kwh(idx: int) -> float | None:
+        for j in range(max(0, idx-3), min(len(lines), idx+4)):
+            mk = kwh_only_pat.search(lines[j])
+            if mk:
+                return _clean_num(mk.group("k"))
+        return None
+
+    def _nearest_rate_c(idx: int) -> float | None:
+        for j in range(max(0, idx-3), min(len(lines), idx+4)):
+            mr = rate_only_pat.search(lines[j])
+            if mr:
+                return _to_cents(_clean_num(mr.group("r")), mr.group("u"))
+        return None
+
+    if prefer_tier:
+        # Step 1
+        if step1_idxs:
+            if "step1_kwh" not in out:
+                k = _nearest_kwh(step1_idxs[0])
+                if k is not None:
+                    out["step1_kwh"] = round(k, 3)
+            if "usage_cents_per_kwh_step1" not in out:
+                r_c = _nearest_rate_c(step1_idxs[0])
+                if r_c is not None:
+                    out["usage_cents_per_kwh_step1"] = round(r_c, 3)
+        # Step 2
+        if step2_idxs:
+            if "step2_kwh" not in out:
+                k = _nearest_kwh(step2_idxs[0])
+                if k is not None:
+                    out["step2_kwh"] = round(k, 3)
+            if "usage_cents_per_kwh_step2" not in out:
+                r_c = _nearest_rate_c(step2_idxs[0])
+                if r_c is not None:
+                    out["usage_cents_per_kwh_step2"] = round(r_c, 3)
+        # If total still missing, sum
+        if "total_kwh" not in out:
+            tot = (out.get("step1_kwh") or 0.0) + (out.get("step2_kwh") or 0.0)
+            if tot > 0:
+                out["total_kwh"] = round(tot, 3)
+
+    # ---------- 6) TOU / FLAT fallback ONLY if we never declared TIERED ----------
+    if out.get("tariff_type") is None:
         rate_any = r'(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$)\s*\/?\s*kwh'
         tou_specs = [
             ("usage_cents_per_kwh_peak", re.compile(r'peak[^.\n]*?' + rate_any, re.IGNORECASE)),
@@ -397,7 +438,7 @@ def parse_bill_text(txt: str) -> dict:
         else:
             flat_pats = [
                 re.compile(r'(anytime|single\s*rate|general|usage|energy)[^.\n]*?' + rate_any, re.IGNORECASE),
-                re.compile(r'(?<!peak)(?<!off)[^.\n]*?' + rate_any, re.IGNORECASE),  # last resort
+                re.compile(r'(?<!peak)(?<!off)[^.\n]*?' + rate_any, re.IGNORECASE),
             ]
             for pat in flat_pats:
                 for ln in lines:
@@ -410,9 +451,10 @@ def parse_bill_text(txt: str) -> dict:
                 if "usage_cents_per_kwh" in out:
                     break
 
-    # ---------- 6) Total cost for the bill (incl. GST) ----------
-    money_pat = re.compile(r'(\$?\s*\d{1,6}(?:,\d{3})*\.\d{2})')
-    preferred_cost_keys = ("current charges", "total for this bill", "electricity charges", "charges this bill", "amount due", "new charges", "total balance")
+    # ---------- 7) Total cost (incl GST) ----------
+    money_pat = re.compile(r'(\$?\s*\d{1,6}(?:,\d{3})*\.\d{2})')  # must have cents
+    preferred_cost_keys = ("current charges", "total for this bill", "electricity charges",
+                           "charges this bill", "amount due", "new charges", "total balance")
     amounts = []
     for i, ln in enumerate(lower):
         if any(k in ln for k in preferred_cost_keys):
@@ -428,7 +470,7 @@ def parse_bill_text(txt: str) -> dict:
         if all_amts:
             out["total_cost_inc_gst"] = round(max(all_amts), 2)
 
-    # ---------- 7) Derive daily_kwh ----------
+    # ---------- 8) Derive daily_kwh ----------
     if "total_kwh" in out and "period_start" in out and "period_end" in out:
         try:
             ds = datetime.fromisoformat(out["period_start"])
@@ -440,205 +482,6 @@ def parse_bill_text(txt: str) -> dict:
 
     return out
 
-def parse_bill_bytes(content: bytes, content_type: str) -> dict:
-    """
-    Extract text (PDF or image) and parse structured values.
-    Falls back to demo defaults if we can’t extract anything.
-    """
-    txt = ocr_extract_text(content, content_type)
-    parsed = parse_bill_text(txt) if txt else {}
-
-    if parsed:
-        parsed.setdefault("tariff_type", parsed.get("tariff_type", "FLAT"))
-        return parsed
-
-    # Fallback demo (so pipeline keeps working)
-    return {
-        "period_start": "2025-06-01",
-        "period_end": "2025-08-01",
-        "total_kwh": 1200,
-        "daily_kwh": round(1200 / 62, 2),
-        "supply_cents_per_day": 110,
-        "usage_cents_per_kwh_peak": 40,
-        "usage_cents_per_kwh_shoulder": 28,
-        "usage_cents_per_kwh_offpeak": 22,
-        "tariff_type": "TOU",
-        "distributor": "Unknown",
-        "total_cost_inc_gst": 540.00
-    }
-
-def _build_digest_html(phone: str) -> str:
-    """Build a simple weekly digest HTML from Redis."""
-    k_bills = f"user:{phone}:bills"
-    entries = r.lrange(k_bills, 0, -1) or []
-    total_bills = len(entries)
-
-    preview = []
-    for raw in entries[-5:]:
-        try:
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", errors="ignore")
-            j = json.loads(raw)
-        except Exception:
-            j = {"media_type": "unknown", "ts": 0}
-        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(j.get("ts", 0)))
-        mtype = (j.get("media_type") or "").split("/")[-1].upper()
-        preview.append(f"<li>{when} — {mtype or 'UNKNOWN'}</li>")
-
-    savings = request.args.get("savings", "100")
-    try:
-        savings_val = float(savings)
-    except Exception:
-        savings_val = 100.0
-
-    html = f"""
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>SwitchBuddy Weekly Digest</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color:#0f172a; margin:0; }}
-    .wrap {{ max-width: 720px; margin: 0 auto; padding: 24px; }}
-    .card {{ background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:20px; box-shadow:0 1px 2px rgba(0,0,0,0.03); }}
-    h1 {{ font-size: 22px; margin:0 0 8px }}
-    h2 {{ font-size: 18px; margin:16px 0 8px }}
-    p  {{ margin: 8px 0 }}
-    .cta {{ display:inline-block; padding:10px 14px; border-radius:10px; text-decoration:none; border:1px solid #0ea5e9; }}
-    .cta-primary {{ background:#0ea5e9; color:white; border-color:#0ea5e9; }}
-    ul {{ margin:8px 0 0 18px }}
-    .muted {{ color:#64748b }}
-    .grid {{ display:grid; gap:12px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }}
-    .panel {{ border:1px solid #e2e8f0; border-radius:10px; padding:12px; }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <h1>⚡ SwitchBuddy — Weekly Digest</h1>
-      <p class="muted">Phone: {phone}</p>
-
-      <div class="grid">
-        <div class="panel">
-          <h2>Summary</h2>
-          <p>Saved bills on file: <strong>{total_bills}</strong></p>
-          <p>Projected annual savings: <strong>${savings_val:,.0f}</strong></p>
-        </div>
-
-        <div class="panel">
-          <h2>Latest uploads</h2>
-          {"<ul>" + "".join(preview) + "</ul>" if preview else "<p class='muted'>No recent bills.</p>"}
-        </div>
-      </div>
-
-      <h2 style="margin-top:16px">Recommendation</h2>
-      <p>Based on your recent usage and current market rates, you’re a good candidate to switch to a <strong>low daily charge</strong> plan.</p>
-      <p class="muted">(*Demo text*) We’ll refine this once we parse TOU blocks and compare against live rates.</p>
-
-      <p style="margin-top:16px">
-        <a class="cta cta-primary" href="#">Switch plan</a>
-        <a class="cta" href="#">See full comparison</a>
-      </p>
-    </div>
-  </div>
-</body>
-</html>
-"""
-    return html
-
-# ---- Tariff fetcher (stub) ----
-def fetch_tariffs_vic():
-    return [
-        {"name": "Flat Saver", "tariff_type": "FLAT", "supply_cents_per_day": 105, "usage_cents_per_kwh": 32},
-        {"name": "TOU Value",  "tariff_type": "TOU",  "supply_cents_per_day": 95,  "peak_cents": 42, "shoulder_cents": 28, "offpeak_cents": 20},
-        {"name": "Daily Low",  "tariff_type": "FLAT", "supply_cents_per_day": 80,  "usage_cents_per_kwh": 36},
-    ]
-
-    plans = fetch_tariffs_vic()
-    scored = [{"plan": p, "annual_cost": estimate_annual_cost(latest_profile, p)} for p in plans]
-    scored.sort(key=lambda x: x["annual_cost"])
-    best = scored[0]
-
-    # Build a "user current plan" adapter from the parsed bill to get a real baseline
-    user_plan = {
-        "tariff_type": (latest_profile.get("tariff_type") or "").upper(),
-        "supply_cents_per_day": latest_profile.get("supply_cents_per_day"),
-        "usage_cents_per_kwh": latest_profile.get("usage_cents_per_kwh"),
-        "peak_cents": latest_profile.get("usage_cents_per_kwh_peak"),
-        "shoulder_cents": latest_profile.get("usage_cents_per_kwh_shoulder"),
-        "offpeak_cents": latest_profile.get("usage_cents_per_kwh_offpeak"),
-        "usage_cents_per_kwh_step1": latest_profile.get("usage_cents_per_kwh_step1"),
-        "usage_cents_per_kwh_step2": latest_profile.get("usage_cents_per_kwh_step2"),
-    }
-    baseline_cost = estimate_annual_cost(latest_profile, user_plan) \
-        if latest_profile.get("supply_cents_per_day") is not None else scored[len(scored)//2]["annual_cost"]
-
-    savings = round(baseline_cost - best["annual_cost"], 2)
-
-    snapshot = {
-        "ts": int(time.time()),
-        "profile": latest_profile,
-        "ranked": scored,
-        "best": best,
-        "baseline_cost": baseline_cost,
-        "projected_savings": savings
-    }
-def compare_and_store(phone: str) -> dict:
-    k_bills = f"user:{phone}:bills"
-    raw_entries = r.lrange(k_bills, 0, -1) or []
-
-    latest_profile = None
-    for raw in reversed(raw_entries):
-        try:
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", errors="ignore")
-            j = json.loads(raw)
-            if j.get("parsed"):
-                latest_profile = j["parsed"]
-                break
-        except Exception:
-            pass
-
-    if not latest_profile:
-        latest_profile = {
-            "total_kwh": 1200,
-            "period_start": "2025-06-01",
-            "period_end": "2025-08-01",
-            "daily_kwh": round(1200/62, 2),
-        }
-
-    plans = fetch_tariffs_vic()
-    scored = [{"plan": p, "annual_cost": estimate_annual_cost(latest_profile, p)} for p in plans]
-    scored.sort(key=lambda x: x["annual_cost"])
-    best = scored[0]
-
-    # Build a "user current plan" adapter from the parsed bill to get a real baseline
-    user_plan = {
-        "tariff_type": (latest_profile.get("tariff_type") or "").upper(),
-        "supply_cents_per_day": latest_profile.get("supply_cents_per_day"),
-        "usage_cents_per_kwh": latest_profile.get("usage_cents_per_kwh"),
-        "peak_cents": latest_profile.get("usage_cents_per_kwh_peak"),
-        "shoulder_cents": latest_profile.get("usage_cents_per_kwh_shoulder"),
-        "offpeak_cents": latest_profile.get("usage_cents_per_kwh_offpeak"),
-        "usage_cents_per_kwh_step1": latest_profile.get("usage_cents_per_kwh_step1"),
-        "usage_cents_per_kwh_step2": latest_profile.get("usage_cents_per_kwh_step2"),
-    }
-    baseline_cost = estimate_annual_cost(latest_profile, user_plan) \
-        if latest_profile.get("supply_cents_per_day") is not None else scored[len(scored)//2]["annual_cost"]
-
-    savings = round(baseline_cost - best["annual_cost"], 2)
-
-    snapshot = {
-        "ts": int(time.time()),
-        "profile": latest_profile,
-        "ranked": scored,
-        "best": best,
-        "baseline_cost": baseline_cost,
-        "projected_savings": savings
-    }
-
-    return snapshot
 
 # -----------------------------
 # Health & diagnostics
