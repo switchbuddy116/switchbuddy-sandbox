@@ -792,7 +792,7 @@ def whatsapp_webhook():
         msg.body("Cool — send the next bill photo/PDF. When finished, say “that's all”.")
         return str(resp)
 
-    # Media handling
+    # Media handling (Twilio sends MediaUrl0/MediaContentType0 when files attached)
     media_url = request.values.get("MediaUrl0")
     media_type = request.values.get("MediaContentType0")
 
@@ -802,23 +802,28 @@ def whatsapp_webhook():
         fetched_type = None
         err = None
         parsed = None
+        ocr_excerpt = None
+
         try:
             content, fetched_type, size_bytes = download_twilio_media(media_url)
             downloaded_ok = True
+
+            # Parse the bill content into a structured profile (stub or real OCR)
             parsed = parse_bill_bytes(content, fetched_type or (media_type or ""))
-# Save a short OCR excerpt for debugging
-try:
-    ocr_text = ocr_extract_text(content, fetched_type or (media_type or ""))
-    if ocr_text:
-        entry["ocr_excerpt"] = ocr_text[:2000]  # keep it small
-except Exception:
-    pass
+
+            # Optional: save a short OCR excerpt for debugging (bounded to 2k chars)
+            try:
+                ocr_text = ocr_extract_text(content, fetched_type or (media_type or ""))
+                if ocr_text:
+                    ocr_excerpt = ocr_text[:2000]
+            except Exception:
+                pass
 
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
 
         entry = {
-            "media_url": media_url,
+            "media_url": media_url,                 # Twilio temp URL (expires)
             "media_type": media_type or fetched_type or "",
             "ts": int(time.time()),
             "downloaded_ok": downloaded_ok,
@@ -827,6 +832,8 @@ except Exception:
         }
         if parsed:
             entry["parsed"] = parsed
+        if ocr_excerpt:
+            entry["ocr_excerpt"] = ocr_excerpt
 
         r.rpush(k_bills, json.dumps(entry))
         new_count = bill_count + 1
@@ -856,21 +863,6 @@ except Exception:
             )
         return str(resp)
 
-    # Fallbacks based on state
-    if state == "collecting":
-        msg.body(
-            "I’m ready — please send a photo/PDF of your bill.\n"
-            "Or say 'that's all' when you’re finished."
-        )
-    elif state == "done":
-        if PUBLIC_BASE_URL:
-            digest_url = f"{PUBLIC_BASE_URL}/digest_preview?phone={quote(phone, safe='')}"
-            msg.body(f"You’re done for now 🎉\nPreview your digest any time: {digest_url}\nSay 'hi' to add more bills.")
-        else:
-            msg.body("You’re done for now 🎉 Say 'hi' if you want to add more bills.")
-    else:
-        msg.body("Say 'hi' to get started with your bill upload.")
-    return str(resp)
 
 # -----------------------------
 # Admin/testing
