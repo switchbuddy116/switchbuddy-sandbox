@@ -192,186 +192,222 @@ def ocr_extract_text(content: bytes, content_type: str) -> str:
 
 def parse_bill_text(txt: str) -> dict:
     """
-    Parser tuned for Alinta VIC bills (like the PDF you sent):
-    - Period from two dates on one line (supports '12 Jun 2025' or '12/06/25')
-    - Daily supply from 'Daily NN.NNN c/Day' or 'Daily Charge ... $0.9xxxx'
-    - Tiered usage: Step 1 + Step 2 / Remaining balance; computes total_kwh
-    - Total cost: prefers $xx.xx near 'New charges', 'Total balance', etc
+    Parse a block of bill text into structured fields using line-level context.
+    Now captures tiered kWh and rates (Step 1 / Step 2) for TIERED plans.
     """
-    import re
-    from datetime import datetime
-
+    # Helpers
     def _clean_num(s: str) -> float:
-        s = s.replace(",", "").replace("$", "")
+        s = s.replace(",", "").replace("$", "").replace("€", "").replace("£", "")
         try:
             return float(s)
         except Exception:
             return 0.0
 
-    # Normalise whitespace and split
+    def _to_cents(value: float, unit: str) -> float:
+        unit = (unit or "").strip()
+        if unit in ("$", "usd", "aud", "nz$", "£", "€"):
+            return value * 100.0  # dollars to cents
+        return value  # already cents
+
+    # Normalise spacing
     txt_norm = re.sub(r"[ \t]+", " ", txt)
     lines = [ln.strip() for ln in txt_norm.splitlines() if ln.strip()]
     lower = [ln.lower() for ln in lines]
 
-    out: dict = {}
+    result: dict = {}
 
-    # ---------- 1) Period ----------
-    # Pattern A: '12 Jun 2025'
+    # ---------- 1) Billing period ----------
+    date_pat = re.compile(
+        r"(?P<d>\d{1,2})[\/\-\s](?P<m>\d{1,2}|[A-Za-z]{3,9})[\/\-\s](?P<y>\d{2,4})",
+        re.IGNORECASE,
+    )
     month_map = {
         'jan':1,'january':1,'feb':2,'february':2,'mar':3,'march':3,'apr':4,'april':4,
         'may':5,'jun':6,'june':6,'jul':7,'july':7,'aug':8,'august':8,'sep':9,'sept':9,'september':9,
         'oct':10,'october':10,'nov':11,'november':11,'dec':12,'december':12
     }
-    mname_pat = re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{2,4})\b")
-    # Pattern B: '12/06/25'
-    dmy_pat = re.compile(r"\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b")
 
-    def _mkdate_name(d, mname, y):
-        y = int(y); y = y + 2000 if y < 100 else y
-        mo = month_map.get(mname.lower(), 1)
+    def _parse_date(m):
+        d = int(m.group("d"))
+        mm = m.group("m")
+        y = int(m.group("y"))
+        if y < 100:
+            y += 2000
+        if mm.isdigit():
+            mo = int(mm)
+        else:
+            mo = month_map.get(mm.lower(), 1)
         try:
-            return datetime(y, mo, int(d))
+            return datetime(y, mo, d)
         except Exception:
             return None
 
-    def _mkdate_dmy(d, m, y):
-        y = int(y); y = y + 2000 if y < 100 else y
-        try:
-            return datetime(y, int(m), int(d))
-        except Exception:
-            return None
-
-    # Look for two dates on the same line
-    for ln in lines:
-        ms = list(mname_pat.finditer(ln))
-        if len(ms) >= 2:
-            ds = _mkdate_name(*ms[0].groups())
-            de = _mkdate_name(*ms[-1].groups())
+    period_found = False
+    for i, ln in enumerate(lower):
+        if any(k in ln for k in ("billing period", "for the period", "supply period", "usage period", "period from")):
+            m_all = list(date_pat.finditer(lines[i]))
+            if len(m_all) >= 2:
+                ds, de = _parse_date(m_all[0]), _parse_date(m_all[-1])
+                if ds and de and de >= ds:
+                    result["period_start"] = ds.date().isoformat()
+                    result["period_end"] = de.date().isoformat()
+                    period_found = True
+                    break
+        if " from " in ln and " to " in ln:
+            m_all = list(date_pat.finditer(lines[i]))
+            if len(m_all) >= 2:
+                ds, de = _parse_date(m_all[0]), _parse_date(m_all[-1])
+                if ds and de and de >= ds:
+                    result["period_start"] = ds.date().isoformat()
+                    result["period_end"] = de.date().isoformat()
+                    period_found = True
+                    break
+    if not period_found:
+        candidates = []
+        for i, ln in enumerate(lower):
+            if "period" in ln or " from " in ln or " to " in ln:
+                for m in date_pat.finditer(lines[i]):
+                    d = _parse_date(m)
+                    if d:
+                        candidates.append((i, d))
+        if len(candidates) >= 2:
+            candidates.sort(key=lambda x: (x[0], x[1]))
+            ds = candidates[0][1]
+            de = max(candidates, key=lambda x: x[1])[1]
             if ds and de and de >= ds:
-                out["period_start"] = ds.date().isoformat()
-                out["period_end"] = de.date().isoformat()
-                break
-        ms = list(dmy_pat.finditer(ln))
-        if len(ms) >= 2:
-            ds = _mkdate_dmy(*ms[0].groups())
-            de = _mkdate_dmy(*ms[-1].groups())
-            if ds and de and de >= ds:
-                out["period_start"] = ds.date().isoformat()
-                out["period_end"] = de.date().isoformat()
-                break
+                result["period_start"] = ds.date().isoformat()
+                result["period_end"] = de.date().isoformat()
 
-    # ---------- 2) Daily supply (c/Day) ----------
-    m = re.search(r"\bDaily\s+(\d{1,4}(?:\.\d+)?)\s*c\/?Day\b", txt_norm, re.IGNORECASE)
-    if m:
-        out["supply_cents_per_day"] = round(float(m.group(1)), 3)
-    else:
-        m2 = re.search(r"Daily\s+Charge[^\n]*?\$(\d{1,2}\.\d{3,})", txt_norm, re.IGNORECASE)
-        if m2:
-            out["supply_cents_per_day"] = round(float(m2.group(1)) * 100.0, 3)  # $ -> cents
-
-    # ---------- 3) Tiers (Step 1 / Step 2 / Remaining balance) ----------
-    step_re = re.compile(
-        r"(?:Step\s*1|Step\s*2|Remaining\s*balance)[^\n]*?"
-        r"(?P<kwh>\d{1,6}(?:\.\d+)?)\s*kWh[^\n]*?\$(?P<rate>0\.\d{3,5})",
+    # ---------- 2) Supply charge (per day) ----------
+    supply_pat = re.compile(
+        r'(supply|daily)\s+(charge|service|fixed).*?(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$)\s*\/?\s*(day|d)\b',
         re.IGNORECASE
     )
-    step1_rate = step2_rate = None
-    step1_kwh = step2_kwh = 0.0
     for ln in lines:
-        m = step_re.search(ln)
-        if not m:
-            continue
-        kwh = _clean_num(m.group("kwh"))
-        rate_c = float(m.group("rate")) * 100.0
-        if "step 1" in ln.lower():
-            step1_rate, step1_kwh = round(rate_c, 3), kwh
-        else:
-            step2_rate, step2_kwh = round(rate_c, 3), kwh
-
-    # Backup rates from plan table (e.g., "Step 1 27.731 c/kWh")
-    if step1_rate is None:
-        m = re.search(r"Step\s*1[^0-9]*?(\d{1,3}\.\d{3,})\s*c\/kWh", txt_norm, re.IGNORECASE)
+        m = supply_pat.search(ln)
         if m:
-            step1_rate = round(float(m.group(1)), 3)
-    if step2_rate is None:
-        m = re.search(r"(?:Step\s*2|Remaining\s*balance)[^0-9]*?(\d{1,3}\.\d{3,})\s*c\/kWh", txt_norm, re.IGNORECASE)
-        if m:
-            step2_rate = round(float(m.group(1)), 3)
+            cents = _to_cents(float(m.group("val")), m.group("unit"))
+            result["supply_cents_per_day"] = round(cents, 4)
+            break
 
-    if step1_rate is not None or step2_rate is not None:
-        out["tariff_type"] = "TIERED"
-        if step1_rate is not None:
-            out["usage_cents_per_kwh_step1"] = step1_rate
-        if step2_rate is not None:
-            out["usage_cents_per_kwh_step2"] = step2_rate
+    # ---------- 3) TIERED (Step 1 / Step 2) extraction ----------
+    # Look for lines containing "step 1"/"step 2" (with optional "peak -", "block", etc),
+    # then extract kWh and $/kWh or c/kWh from that line (and the next line, if wrapped).
+    kwh_pat = re.compile(r'(?<![\d\.])(\d{1,6}(?:[,\d]{0,6})?(?:\.\d+)?)\s*kwh\b', re.IGNORECASE)
+    rate_pat = re.compile(r'(\d{1,4}(?:\.\d+)?)\s*([c¢]|\$)\s*\/?\s*kwh', re.IGNORECASE)
+    step1_idxs = [i for i, ln in enumerate(lower) if re.search(r'\bstep\s*1\b', ln)]
+    step2_idxs = [i for i, ln in enumerate(lower) if re.search(r'\bstep\s*2\b', ln)]
 
-    # ---------- 4) Total kWh ----------
-    total_kwh = 0.0
-    if step1_kwh or step2_kwh:
-        total_kwh = step1_kwh + step2_kwh
-    else:
-        # Try a visible "Usage kWh" total near its label
-        for i, ln in enumerate(lower):
-            if "usage kwh" in ln:
-                for j in range(i, min(i + 3, len(lines))):
-                    mm = re.search(r"(\d{1,6}\.\d{2,})\s*$", lines[j])
-                    if mm:
-                        total_kwh = _clean_num(mm.group(1))
-                        break
-                if total_kwh:
+    step1_kwh = step2_kwh = None
+    step1_rate_c = step2_rate_c = None
+    found_tier = False
+
+    def _scan_step(idx_list):
+        # Returns (kwh, rate_cents) for the first good match
+        for i in idx_list:
+            blob = lines[i]
+            if i + 1 < len(lines):
+                blob = blob + " " + lines[i + 1]  # handle wrapped content
+            mk = kwh_pat.search(blob)
+            mr = rate_pat.search(blob)
+            kwh = _clean_num(mk.group(1)) if mk else None
+            rate_c = _to_cents(_clean_num(mr.group(1)), mr.group(2)) if mr else None
+            if (kwh is not None) or (rate_c is not None):
+                return (kwh, rate_c)
+        return (None, None)
+
+    if step1_idxs or step2_idxs:
+        found_tier = True
+        s1k, s1r = _scan_step(step1_idxs)
+        s2k, s2r = _scan_step(step2_idxs)
+        if s1k is not None:
+            step1_kwh = s1k
+            result["step1_kwh"] = round(step1_kwh, 3)
+        if s2k is not None:
+            step2_kwh = s2k
+            result["step2_kwh"] = round(step2_kwh, 3)
+        if s1r is not None:
+            step1_rate_c = s1r
+            result["usage_cents_per_kwh_step1"] = round(step1_rate_c, 3)
+        if s2r is not None:
+            step2_rate_c = s2r
+            result["usage_cents_per_kwh_step2"] = round(step2_rate_c, 3)
+
+    # If we found any tier info, mark tariff type
+    if found_tier:
+        result["tariff_type"] = "TIERED"
+
+    # If total_kwh missing, sum tiers when available
+    if "total_kwh" not in result and (step1_kwh or step2_kwh):
+        tot = (step1_kwh or 0.0) + (step2_kwh or 0.0)
+        if tot > 0:
+            result["total_kwh"] = round(tot, 3)
+
+    # ---------- 4) TOU or FLAT usage rates (fallbacks if not tiered) ----------
+    if result.get("tariff_type") != "TIERED":
+        rate_any = r'(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$)\s*\/?\s*kwh'
+        tou_specs = [
+            ("usage_cents_per_kwh_peak", re.compile(r'peak[^.\n]*?' + rate_any, re.IGNORECASE)),
+            ("usage_cents_per_kwh_shoulder", re.compile(r'shoulder[^.\n]*?' + rate_any, re.IGNORECASE)),
+            ("usage_cents_per_kwh_offpeak", re.compile(r'(off-?peak|off peak)[^.\n]*?' + rate_any, re.IGNORECASE)),
+        ]
+        found_tou = False
+        for key, pat in tou_specs:
+            for ln in lines:
+                m = pat.search(ln)
+                if m:
+                    val = _to_cents(float(m.group("val")), m.group("unit"))
+                    result[key] = round(val, 4)
+                    found_tou = True
                     break
-        # Fallback: explicit kWh tokens; attempt sum of top 2 if they look like steps
-        if not total_kwh:
-            kwhs = [_clean_num(m.group(1)) for m in re.finditer(r"(\d{1,6}(?:\.\d+)?)\s*kWh\b", txt_norm, re.IGNORECASE)]
-            if kwhs:
-                kwhs.sort(reverse=True)
-                total_kwh = kwhs[0] + kwhs[1] if len(kwhs) >= 2 else kwhs[0]
-    if total_kwh:
-        out["total_kwh"] = round(total_kwh, 3)
+        if found_tou:
+            result["tariff_type"] = "TOU"
+        else:
+            flat_pats = [
+                re.compile(r'(anytime|single\s*rate|general|usage|energy)[^.\n]*?' + rate_any, re.IGNORECASE),
+                re.compile(r'(?<!peak)(?<!off)[^.\n]*?' + rate_any, re.IGNORECASE),  # last resort
+            ]
+            for pat in flat_pats:
+                for ln in lines:
+                    m = pat.search(ln)
+                    if m:
+                        val = _to_cents(float(m.group("val")), m.group("unit"))
+                        result["tariff_type"] = "FLAT"
+                        result["usage_cents_per_kwh"] = round(val, 4)
+                        break
+                if "usage_cents_per_kwh" in result:
+                    break
 
-    # Daily usage fallback from "Daily usage xx.xx kWh"
-    if "daily_kwh" not in out:
-        m = re.search(r"Daily\s+usage\s+(\d{1,3}(?:\.\d{1,2})?)\s*kWh", txt_norm, re.IGNORECASE)
-        if m:
-            out["daily_kwh"] = float(m.group(1))
+    # ---------- 5) Total cost for the bill (incl. GST) ----------
+    # Require cents to avoid matching account numbers.
+    money_pat = re.compile(r'(\$?\s*\d{1,6}(?:,\d{3})*\.\d{2})')
+    preferred_cost_keys = ("current charges", "total for this bill", "electricity charges", "charges this bill", "amount due", "new charges", "total balance")
+    amounts = []
+    for i, ln in enumerate(lower):
+        if any(k in ln for k in preferred_cost_keys):
+            for m in money_pat.finditer(lines[i]):
+                amt = _clean_num(m.group(1))
+                if amt > 0:
+                    amounts.append((i, amt))
+    if amounts:
+        best = max(amounts, key=lambda x: x[1])[1]
+        result["total_cost_inc_gst"] = round(best, 2)
+    else:
+        all_amts = [_clean_num(m.group(1)) for m in money_pat.finditer(txt)]
+        if all_amts:
+            result["total_cost_inc_gst"] = round(max(all_amts), 2)
 
-    # Derive daily_kwh from period if we have totals and dates
-    if "total_kwh" in out and "period_start" in out and "period_end" in out and "daily_kwh" not in out:
+    # ---------- 6) Derive daily_kwh ----------
+    if "total_kwh" in result and "period_start" in result and "period_end" in result:
         try:
-            ds = datetime.fromisoformat(out["period_start"])
-            de = datetime.fromisoformat(out["period_end"])
+            ds = datetime.fromisoformat(result["period_start"])
+            de = datetime.fromisoformat(result["period_end"])
             days = max((de - ds).days, 1)
-            out["daily_kwh"] = round(out["total_kwh"] / days, 2)
+            result["daily_kwh"] = round(float(result["total_kwh"]) / days, 2)
         except Exception:
             pass
 
-    # ---------- 5) Total cost (incl. GST) ----------
-    cost_keywords = (
-        "total for this bill", "current charges", "charges this bill",
-        "electricity charges", "amount due", "total balance", "new charges"
-    )
-    def _money_vals(s: str):
-        # Match $xx.xx OR xx.xx (require cents) to avoid huge IDs like 104100125
-        for mm in re.finditer(r'\$\s*(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)|\b(\d{1,6}\.\d{2})\b', s):
-            val = mm.group(1) or mm.group(2)
-            if val:
-                yield _clean_num(val)
-
-    weighted = []
-    for i, ln in enumerate(lower):
-        vals = list(_money_vals(lines[i]))
-        if not vals:
-            continue
-        if any(k in ln for k in cost_keywords):
-            for v in vals:
-                weighted.append((2, v))  # prefer amounts near these labels
-        else:
-            for v in vals:
-                weighted.append((1, v))
-    if weighted:
-        out["total_cost_inc_gst"] = round(max(weighted, key=lambda t: (t[0], t[1]))[1], 2)
-
-    return out
+    return result
 
 def parse_bill_bytes(content: bytes, content_type: str) -> dict:
     """
