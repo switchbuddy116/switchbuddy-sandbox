@@ -79,7 +79,6 @@ app = Flask(__name__)
 # -----------------------------
 # Helpers
 # -----------------------------
-
 def e164(raw: str) -> str:
     """Normalize a WhatsApp/phone value to +E164 for Redis keys."""
     if not raw:
@@ -137,41 +136,6 @@ def download_twilio_media(media_url: str, timeout=15):
     return content, content_type, (content_length if content_length is not None else len(content))
 
 # ---------- OCR & parsing pipeline ----------
-
-_DATE_PAT = re.compile(
-    r'(?P<d>\d{1,2})[\/\-\s](?P<m>\d{1,2}|[A-Za-z]{3,9})[\/\-\s](?P<y>\d{2,4})',
-    re.IGNORECASE
-)
-_KWH_PAT = re.compile(r'(?<![\d\.])(?P<kwh>\d{2,6}(?:\.\d+)?)\s*kwh\b', re.IGNORECASE)
-_SUPPLY_CPD_PAT = re.compile(r'(supply|daily)\s+charge.*?(?P<cents>\d{1,4}(?:\.\d+)?)\s*c(?:ents)?\/?day', re.IGNORECASE)
-_USAGE_FLAT_PAT = re.compile(r'(usage|energy)\s+charge.*?(?P<cents>\d{1,4}(?:\.\d+)?)\s*c(?:ents)?\/?kwh', re.IGNORECASE)
-_TOU_PEAK_PAT = re.compile(r'peak.*?(?P<cents>\d{1,4}(?:\.\d+)?)\s*c(?:ents)?\/?kwh', re.IGNORECASE)
-_TOU_SHOULDER_PAT = re.compile(r'shoulder.*?(?P<cents>\d{1,4}(?:\.\d+)?)\s*c(?:ents)?\/?kwh', re.IGNORECASE)
-_TOU_OFFPEAK_PAT = re.compile(r'(off-?peak|off peak).*?(?P<cents>\d{1,4}(?:\.\d+)?)\s*c(?:ents)?\/?kwh', re.IGNORECASE)
-_TARIFF_TOU_HINT = re.compile(r'\b(TOU|time\s*of\s*use)\b', re.IGNORECASE)
-_COST_TOTAL_PAT = re.compile(r'\$\s?(?P<amt>\d{2,6}(?:\.\d{2})?)\s*(inc\.?\s*gst|incl\.?\s*gst|incl gst)?', re.IGNORECASE)
-
-_MONTH_MAP = {
-    'jan':1,'january':1,'feb':2,'february':2,'mar':3,'march':3,'apr':4,'april':4,
-    'may':5,'jun':6,'june':6,'jul':7,'july':7,'aug':8,'august':8,'sep':9,'sept':9,'september':9,
-    'oct':10,'october':10,'nov':11,'november':11,'dec':12,'december':12
-}
-
-def _parse_date_triplet(m):
-    d = int(m.group('d'))
-    mm = m.group('m')
-    y = int(m.group('y'))
-    if y < 100:  # 25 -> 2025 heuristic
-        y += 2000
-    if mm.isdigit():
-        month = int(mm)
-    else:
-        month = _MONTH_MAP.get(mm.lower(), 1)
-    try:
-        return datetime(y, month, d)
-    except Exception:
-        return None
-
 def ocr_extract_text(content: bytes, content_type: str) -> str:
     """
     Extract text from bytes using:
@@ -216,7 +180,6 @@ def ocr_extract_text(content: bytes, content_type: str) -> str:
         try:
             if os.environ.get("TESSERACT_CMD"):
                 pytesseract.pytesseract.tesseract_cmd = os.environ["TESSERACT_CMD"]
-            # Try to open as an image
             img = Image.open(io.BytesIO(content))
             txt = pytesseract.image_to_string(img)
             if txt:
@@ -229,204 +192,186 @@ def ocr_extract_text(content: bytes, content_type: str) -> str:
 
 def parse_bill_text(txt: str) -> dict:
     """
-    Parse a block of bill text into structured fields using line-level context.
-    Tries hard to avoid grabbing 'due date' or 'total account balance' by mistake.
+    Parser tuned for Alinta VIC bills (like the PDF you sent):
+    - Period from two dates on one line (supports '12 Jun 2025' or '12/06/25')
+    - Daily supply from 'Daily NN.NNN c/Day' or 'Daily Charge ... $0.9xxxx'
+    - Tiered usage: Step 1 + Step 2 / Remaining balance; computes total_kwh
+    - Total cost: prefers $xx.xx near 'New charges', 'Total balance', etc
     """
     import re
     from datetime import datetime
 
     def _clean_num(s: str) -> float:
-        s = s.replace(",", "").replace("$", "").replace("€", "").replace("£", "")
+        s = s.replace(",", "").replace("$", "")
         try:
             return float(s)
         except Exception:
             return 0.0
 
-    def _to_cents(value: float, unit: str) -> float:
-        unit = (unit or "").strip()
-        if unit in ("$", "usd", "aud", "nz$", "£", "€"):
-            return value * 100.0
-        # treat c/¢ as cents
-        return value
-
-    # Normalise spacing
+    # Normalise whitespace and split
     txt_norm = re.sub(r"[ \t]+", " ", txt)
     lines = [ln.strip() for ln in txt_norm.splitlines() if ln.strip()]
     lower = [ln.lower() for ln in lines]
 
-    result: dict = {}
+    out: dict = {}
 
-    # ---------- 1) Billing period ----------
-    # Prefer explicit markers like "Billing period", "For the period", "From ... to ..."
-    date_pat = re.compile(
-        r"(?P<d>\d{1,2})[\/\-\s](?P<m>\d{1,2}|[A-Za-z]{3,9})[\/\-\s](?P<y>\d{2,4})",
-        re.IGNORECASE,
-    )
+    # ---------- 1) Period ----------
+    # Pattern A: '12 Jun 2025'
     month_map = {
         'jan':1,'january':1,'feb':2,'february':2,'mar':3,'march':3,'apr':4,'april':4,
         'may':5,'jun':6,'june':6,'jul':7,'july':7,'aug':8,'august':8,'sep':9,'sept':9,'september':9,
         'oct':10,'october':10,'nov':11,'november':11,'dec':12,'december':12
     }
+    mname_pat = re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{2,4})\b")
+    # Pattern B: '12/06/25'
+    dmy_pat = re.compile(r"\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b")
 
-    def _parse_date(m):
-        d = int(m.group("d"))
-        mm = m.group("m")
-        y = int(m.group("y"))
-        if y < 100:
-            y += 2000
-        if mm.isdigit():
-            mo = int(mm)
-        else:
-            mo = month_map.get(mm.lower(), 1)
+    def _mkdate_name(d, mname, y):
+        y = int(y); y = y + 2000 if y < 100 else y
+        mo = month_map.get(mname.lower(), 1)
         try:
-            return datetime(y, mo, d)
+            return datetime(y, mo, int(d))
         except Exception:
             return None
 
-    period_found = False
-    for i, ln in enumerate(lower):
-        if any(k in ln for k in ("billing period", "for the period", "supply period", "usage period", "period from")):
-            m_all = list(date_pat.finditer(lines[i]))
-            if len(m_all) >= 2:
-                ds, de = _parse_date(m_all[0]), _parse_date(m_all[-1])
-                if ds and de and de >= ds:
-                    result["period_start"] = ds.date().isoformat()
-                    result["period_end"] = de.date().isoformat()
-                    period_found = True
-                    break
-        # "from ... to ..." on a single line
-        if " from " in ln and " to " in ln:
-            m_all = list(date_pat.finditer(lines[i]))
-            if len(m_all) >= 2:
-                ds, de = _parse_date(m_all[0]), _parse_date(m_all[-1])
-                if ds and de and de >= ds:
-                    result["period_start"] = ds.date().isoformat()
-                    result["period_end"] = de.date().isoformat()
-                    period_found = True
-                    break
+    def _mkdate_dmy(d, m, y):
+        y = int(y); y = y + 2000 if y < 100 else y
+        try:
+            return datetime(y, int(m), int(d))
+        except Exception:
+            return None
 
-    if not period_found:
-        # Fallback: pick two dates that are close to each other on lines mentioning "period"
-        candidates = []
-        for i, ln in enumerate(lower):
-            if "period" in ln or "from" in ln or "to " in ln:
-                for m in date_pat.finditer(lines[i]):
-                    d = _parse_date(m)
-                    if d:
-                        candidates.append((i, d))
-        if len(candidates) >= 2:
-            candidates.sort(key=lambda x: (x[0], x[1]))
-            ds = candidates[0][1]
-            de = max(candidates, key=lambda x: x[1])[1]
+    # Look for two dates on the same line
+    for ln in lines:
+        ms = list(mname_pat.finditer(ln))
+        if len(ms) >= 2:
+            ds = _mkdate_name(*ms[0].groups())
+            de = _mkdate_name(*ms[-1].groups())
             if ds and de and de >= ds:
-                result["period_start"] = ds.date().isoformat()
-                result["period_end"] = de.date().isoformat()
+                out["period_start"] = ds.date().isoformat()
+                out["period_end"] = de.date().isoformat()
+                break
+        ms = list(dmy_pat.finditer(ln))
+        if len(ms) >= 2:
+            ds = _mkdate_dmy(*ms[0].groups())
+            de = _mkdate_dmy(*ms[-1].groups())
+            if ds and de and de >= ds:
+                out["period_start"] = ds.date().isoformat()
+                out["period_end"] = de.date().isoformat()
+                break
 
-    # ---------- 2) Total kWh for THIS bill ----------
-    # Prefer lines with "total usage", "electricity used", "this bill"
-    kwh_line_idx = None
-    for i, ln in enumerate(lower):
-        if any(k in ln for k in ("total usage", "electricity used", "usage this bill", "total kwh", "energy used")):
-            kwh_line_idx = i
-            break
+    # ---------- 2) Daily supply (c/Day) ----------
+    m = re.search(r"\bDaily\s+(\d{1,4}(?:\.\d+)?)\s*c\/?Day\b", txt_norm, re.IGNORECASE)
+    if m:
+        out["supply_cents_per_day"] = round(float(m.group(1)), 3)
+    else:
+        m2 = re.search(r"Daily\s+Charge[^\n]*?\$(\d{1,2}\.\d{3,})", txt_norm, re.IGNORECASE)
+        if m2:
+            out["supply_cents_per_day"] = round(float(m2.group(1)) * 100.0, 3)  # $ -> cents
 
-    kwh_pat = re.compile(r'(?<![\d\.])(?P<kwh>\d{1,6}(?:[,\d]{0,6})?(?:\.\d+)?)\s*kwh\b', re.IGNORECASE)
-    total_kwh = 0.0
-    if kwh_line_idx is not None:
-        m = kwh_pat.search(lines[kwh_line_idx])
-        if m:
-            total_kwh = _clean_num(m.group("kwh"))
-    if not total_kwh:
-        # fallback: max kWh anywhere (still constrained by the 'kwh' token)
-        m_all = [m for m in kwh_pat.finditer(txt)]
-        if m_all:
-            total_kwh = max(_clean_num(m.group("kwh")) for m in m_all)
-    if total_kwh:
-        result["total_kwh"] = total_kwh
-
-    # ---------- 3) Supply charge (per day) ----------
-    # Support cents or dollars per day, and various phrasings.
-    supply_pat = re.compile(
-        r'(supply|daily)\s+(charge|service|fixed).*?(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$)\s*\/?\s*(day|d)\b',
+    # ---------- 3) Tiers (Step 1 / Step 2 / Remaining balance) ----------
+    step_re = re.compile(
+        r"(?:Step\s*1|Step\s*2|Remaining\s*balance)[^\n]*?"
+        r"(?P<kwh>\d{1,6}(?:\.\d+)?)\s*kWh[^\n]*?\$(?P<rate>0\.\d{3,5})",
         re.IGNORECASE
     )
-    for i, ln in enumerate(lines):
-        m = supply_pat.search(ln)
+    step1_rate = step2_rate = None
+    step1_kwh = step2_kwh = 0.0
+    for ln in lines:
+        m = step_re.search(ln)
+        if not m:
+            continue
+        kwh = _clean_num(m.group("kwh"))
+        rate_c = float(m.group("rate")) * 100.0
+        if "step 1" in ln.lower():
+            step1_rate, step1_kwh = round(rate_c, 3), kwh
+        else:
+            step2_rate, step2_kwh = round(rate_c, 3), kwh
+
+    # Backup rates from plan table (e.g., "Step 1 27.731 c/kWh")
+    if step1_rate is None:
+        m = re.search(r"Step\s*1[^0-9]*?(\d{1,3}\.\d{3,})\s*c\/kWh", txt_norm, re.IGNORECASE)
         if m:
-            cents = _to_cents(float(m.group("val")), m.group("unit"))
-            result["supply_cents_per_day"] = round(cents, 4)
-            break
+            step1_rate = round(float(m.group(1)), 3)
+    if step2_rate is None:
+        m = re.search(r"(?:Step\s*2|Remaining\s*balance)[^0-9]*?(\d{1,3}\.\d{3,})\s*c\/kWh", txt_norm, re.IGNORECASE)
+        if m:
+            step2_rate = round(float(m.group(1)), 3)
 
-    # ---------- 4) Usage rates ----------
-    # Handle TOU (peak/shoulder/off-peak) and FLAT/anytime.
-    rate_any = r'(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$)\s*\/?\s*kwh'
+    if step1_rate is not None or step2_rate is not None:
+        out["tariff_type"] = "TIERED"
+        if step1_rate is not None:
+            out["usage_cents_per_kwh_step1"] = step1_rate
+        if step2_rate is not None:
+            out["usage_cents_per_kwh_step2"] = step2_rate
 
-    tou_specs = [
-        ("usage_cents_per_kwh_peak", re.compile(r'peak[^.\n]*?' + rate_any, re.IGNORECASE)),
-        ("usage_cents_per_kwh_shoulder", re.compile(r'shoulder[^.\n]*?' + rate_any, re.IGNORECASE)),
-        ("usage_cents_per_kwh_offpeak", re.compile(r'(off-?peak|off peak)[^.\n]*?' + rate_any, re.IGNORECASE)),
-    ]
-    found_tou = False
-    for key, pat in tou_specs:
-        for ln in lines:
-            m = pat.search(ln)
-            if m:
-                val = _to_cents(float(m.group("val")), m.group("unit"))
-                result[key] = round(val, 4)
-                found_tou = True
-                break
-
-    if found_tou:
-        result["tariff_type"] = "TOU"
+    # ---------- 4) Total kWh ----------
+    total_kwh = 0.0
+    if step1_kwh or step2_kwh:
+        total_kwh = step1_kwh + step2_kwh
     else:
-        # Flat / single / anytime
-        flat_pats = [
-            re.compile(r'(anytime|single\s*rate|general|usage|energy)[^.\n]*?' + rate_any, re.IGNORECASE),
-            re.compile(r'(?<!peak)(?<!off)[^.\n]*?' + rate_any, re.IGNORECASE),  # last resort
-        ]
-        for pat in flat_pats:
-            for ln in lines:
-                m = pat.search(ln)
-                if m:
-                    val = _to_cents(float(m.group("val")), m.group("unit"))
-                    result["tariff_type"] = "FLAT"
-                    result["usage_cents_per_kwh"] = round(val, 4)
+        # Try a visible "Usage kWh" total near its label
+        for i, ln in enumerate(lower):
+            if "usage kwh" in ln:
+                for j in range(i, min(i + 3, len(lines))):
+                    mm = re.search(r"(\d{1,6}\.\d{2,})\s*$", lines[j])
+                    if mm:
+                        total_kwh = _clean_num(mm.group(1))
+                        break
+                if total_kwh:
                     break
-            if "usage_cents_per_kwh" in result:
-                break
+        # Fallback: explicit kWh tokens; attempt sum of top 2 if they look like steps
+        if not total_kwh:
+            kwhs = [_clean_num(m.group(1)) for m in re.finditer(r"(\d{1,6}(?:\.\d+)?)\s*kWh\b", txt_norm, re.IGNORECASE)]
+            if kwhs:
+                kwhs.sort(reverse=True)
+                total_kwh = kwhs[0] + kwhs[1] if len(kwhs) >= 2 else kwhs[0]
+    if total_kwh:
+        out["total_kwh"] = round(total_kwh, 3)
 
-    # ---------- 5) Total cost for the bill (incl. GST) ----------
-    # Prefer lines with "current charges", "total for this bill", "electricity charges".
-    money_pat = re.compile(r'(\$?\s*\d{1,6}(?:,\d{3})*(?:\.\d{2})?)')
-    preferred_cost_keys = ("current charges", "total for this bill", "electricity charges", "charges this bill", "amount due")
-    amounts = []
-    for i, ln in enumerate(lower):
-        if any(k in ln for k in preferred_cost_keys):
-            for m in money_pat.finditer(lines[i]):
-                amt = _clean_num(m.group(1))
-                if amt > 0:
-                    amounts.append((i, amt))
-    if amounts:
-        # Take the LARGEST amount among preferred lines (often the 'total this bill')
-        best = max(amounts, key=lambda x: x[1])[1]
-        result["total_cost_inc_gst"] = round(best, 2)
-    else:
-        # fallback: largest money amount anywhere (may be wrong, but better than nothing)
-        all_amts = [ _clean_num(m.group(1)) for m in money_pat.finditer(txt) ]
-        if all_amts:
-            result["total_cost_inc_gst"] = round(max(all_amts), 2)
+    # Daily usage fallback from "Daily usage xx.xx kWh"
+    if "daily_kwh" not in out:
+        m = re.search(r"Daily\s+usage\s+(\d{1,3}(?:\.\d{1,2})?)\s*kWh", txt_norm, re.IGNORECASE)
+        if m:
+            out["daily_kwh"] = float(m.group(1))
 
-    # ---------- 6) Derive daily_kwh if possible ----------
-    if "total_kwh" in result and "period_start" in result and "period_end" in result:
+    # Derive daily_kwh from period if we have totals and dates
+    if "total_kwh" in out and "period_start" in out and "period_end" in out and "daily_kwh" not in out:
         try:
-            ds = datetime.fromisoformat(result["period_start"])
-            de = datetime.fromisoformat(result["period_end"])
+            ds = datetime.fromisoformat(out["period_start"])
+            de = datetime.fromisoformat(out["period_end"])
             days = max((de - ds).days, 1)
-            result["daily_kwh"] = round(float(result["total_kwh"]) / days, 2)
+            out["daily_kwh"] = round(out["total_kwh"] / days, 2)
         except Exception:
             pass
 
-    return result
+    # ---------- 5) Total cost (incl. GST) ----------
+    cost_keywords = (
+        "total for this bill", "current charges", "charges this bill",
+        "electricity charges", "amount due", "total balance", "new charges"
+    )
+    def _money_vals(s: str):
+        # Match $xx.xx OR xx.xx (require cents) to avoid huge IDs like 104100125
+        for mm in re.finditer(r'\$\s*(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)|\b(\d{1,6}\.\d{2})\b', s):
+            val = mm.group(1) or mm.group(2)
+            if val:
+                yield _clean_num(val)
+
+    weighted = []
+    for i, ln in enumerate(lower):
+        vals = list(_money_vals(lines[i]))
+        if not vals:
+            continue
+        if any(k in ln for k in cost_keywords):
+            for v in vals:
+                weighted.append((2, v))  # prefer amounts near these labels
+        else:
+            for v in vals:
+                weighted.append((1, v))
+    if weighted:
+        out["total_cost_inc_gst"] = round(max(weighted, key=lambda t: (t[0], t[1]))[1], 2)
+
+    return out
 
 def parse_bill_bytes(content: bytes, content_type: str) -> dict:
     """
@@ -437,8 +382,7 @@ def parse_bill_bytes(content: bytes, content_type: str) -> dict:
     parsed = parse_bill_text(txt) if txt else {}
 
     if parsed:
-        # Provide conservative fill-ins
-        parsed.setdefault("tariff_type", "FLAT")
+        parsed.setdefault("tariff_type", parsed.get("tariff_type", "FLAT"))
         return parsed
 
     # Fallback demo (so pipeline keeps working)
@@ -652,6 +596,94 @@ def redis_diag():
             "has_url": bool(UPSTASH_URL),
         }, 500
 
+# --- Debug & utility endpoints ---
+VERSION = "SBY-2025-08-17-parse2"
+
+import inspect
+from hashlib import sha1
+
+@app.route("/version", methods=["GET"])
+def version():
+    # Quick proof of which build is live
+    src = inspect.getsource(parse_bill_text)
+    sig = sha1(src.encode("utf-8")).hexdigest()[:12]
+    return {
+        "version": VERSION,
+        "parse_bill_text_sha": sig,
+        "has_TIERED_literal": ("TIERED" in src),
+        "first_line": inspect.getsourcelines(parse_bill_text)[1],
+        "num_lines": len(inspect.getsourcelines(parse_bill_text)[0]),
+    }, 200
+
+@app.route("/_debug/parser", methods=["GET"])
+def debug_parser():
+    # Returns the first few lines of the active parser, so we can confirm it’s the new one
+    src = inspect.getsource(parse_bill_text)
+    preview = "\n".join(src.splitlines()[:20])
+    return {
+        "starts_at": inspect.getsourcelines(parse_bill_text)[1],
+        "preview_first_20_lines": preview,
+    }, 200
+
+@app.route("/force_reparse", methods=["POST","GET"])
+def force_reparse():
+    """
+    Re-downloads the last bill for the given phone and re-parses it with the
+    CURRENT code, writing a new entry. No WhatsApp re-send needed.
+      Usage: /force_reparse?phone=%2B61XXXXXXXXX
+    """
+    phone = e164(request.args.get("phone", ""))
+    if not phone:
+        return {"error": "Missing ?phone=E164 (encode + as %2B)"}, 400
+
+    k_bills = f"user:{phone}:bills"
+    last_raw = r.lindex(k_bills, -1)
+    if not last_raw:
+        return {"error": "No bills saved for this phone"}, 404
+
+    try:
+        if isinstance(last_raw, bytes):
+            last_raw = last_raw.decode("utf-8", errors="ignore")
+        last = json.loads(last_raw)
+    except Exception as e:
+        return {"error": f"Corrupt last bill JSON: {e}"}, 500
+
+    media_url = last.get("media_url")
+    media_type = last.get("media_type")
+    if not media_url:
+        return {"error": "Last bill has no media_url"}, 500
+
+    # Try fresh fetch (Twilio links can expire)
+    try:
+        content, fetched_type, size_bytes = download_twilio_media(media_url)
+    except Exception as e:
+        return {"error": f"Re-download failed: {type(e).__name__}: {e}"}, 502
+
+    # Parse with the code that’s live right now
+    parsed = parse_bill_bytes(content, fetched_type or (media_type or ""))
+    ocr_text = ocr_extract_text(content, fetched_type or (media_type or "")) or ""
+    ocr_excerpt = ocr_text[:2000] if ocr_text else None
+
+    new_entry = {
+        "media_url": media_url,
+        "media_type": fetched_type or media_type or "",
+        "ts": int(time.time()),
+        "downloaded_ok": True,
+        "download_err": None,
+        "download_size_bytes": size_bytes,
+        "parsed": parsed,
+    }
+    if ocr_excerpt:
+        new_entry["ocr_excerpt"] = ocr_excerpt
+
+    r.rpush(k_bills, json.dumps(new_entry))
+    return {
+        "status": "reparsed",
+        "new_ts": new_entry["ts"],
+        "parsed": parsed
+    }, 200
+
+
 # -----------------------------
 # Simple session smoke tests
 # -----------------------------
@@ -666,6 +698,14 @@ def get_session():
     if isinstance(value, bytes):
         value = value.decode("utf-8", errors="ignore")
     return f"Value from Redis: {value}", 200
+
+# --- Debug: version ping ---
+VERSION = "SBY-2025-08-17-parse2"
+
+@app.route("/version", methods=["GET"])
+def version():
+    return {"version": VERSION}, 200
+
 
 # -----------------------------
 # Weekly digest (HTML)
@@ -720,16 +760,15 @@ def whatsapp_webhook():
         return any(p in incoming_msg for p in phrases)
 
     # --- Intents ---
-
     if said_any("hi", "hello", "start"):
         r.set(k_state, "collecting")
         msg.body(
-            "Hi! I’m SwitchBuddy ⚡️\n\n"
+            "Hi! I'm SwitchBuddy.\n\n"
             "Please send a photo or PDF of your electricity bill.\n\n"
-            "When you’re finished:\n"
+            "When you're finished:\n"
             "• Reply: 'add another bill' to upload more\n"
             "• Reply: 'that's all' to finish\n"
-            "• Reply: 'list bills' to see what I’ve saved\n"
+            "• Reply: 'list bills' to see what I've saved\n"
             "• Reply: 'digest' to get your weekly digest link"
         )
         return str(resp)
@@ -739,7 +778,7 @@ def whatsapp_webhook():
             msg.body("Digest preview is not available yet (missing PUBLIC_BASE_URL).")
             return str(resp)
         digest_url = f"{PUBLIC_BASE_URL}/digest_preview?phone={quote(phone, safe='')}"
-        msg.body(f"Here’s your digest preview:\n{digest_url}")
+        msg.body(f"Here's your digest preview:\n{digest_url}")
         return str(resp)
 
     if said_any("that's all", "thats all", "done", "finish", "finished", "all done"):
@@ -752,23 +791,23 @@ def whatsapp_webhook():
         if PUBLIC_BASE_URL:
             digest_url = f"{PUBLIC_BASE_URL}/digest_preview?phone={quote(phone, safe='')}"
             msg.body(
-                f"All set! I’ve saved {count} bill(s).\n"
+                f"All set! I've saved {count} bill(s).\n"
                 f"Projected annual savings: ${savings:,.0f}.\n\n"
                 f"Preview your weekly digest here: {digest_url}\n\n"
                 "If you want to add more later, just say 'hi'."
             )
         else:
             msg.body(
-                f"All set! I’ve saved {count} bill(s).\n"
+                f"All set! I've saved {count} bill(s).\n"
                 f"Projected annual savings: ${savings:,.0f}.\n"
-                "I’ll include this in your weekly digest. If you want to add more later, just say 'hi'."
+                "I'll include this in your weekly digest. If you want to add more later, just say 'hi'."
             )
         return str(resp)
 
     if said_any("list bills", "show bills", "what have you saved"):
         entries = r.lrange(k_bills, -10, -1) or []
         if not entries:
-            msg.body("I haven’t saved any bill files yet. Send a photo/PDF to add one.")
+            msg.body("I haven't saved any bill files yet. Send a photo/PDF to add one.")
             return str(resp)
 
         lines = []
@@ -789,7 +828,7 @@ def whatsapp_webhook():
 
     if said_any("add another bill", "add another", "another bill", "add more", "upload another"):
         r.set(k_state, "collecting")
-        msg.body("Cool — send the next bill photo/PDF. When finished, say “that's all”.")
+        msg.body("Cool — send the next bill photo/PDF. When finished, say 'that's all'.")
         return str(resp)
 
     # Media handling (Twilio sends MediaUrl0/MediaContentType0 when files attached)
@@ -850,19 +889,34 @@ def whatsapp_webhook():
                 human_size = f"{size_bytes/1024/1024:.2f} MB"
 
             msg.body(
-                f"Bill received ✅ (#{new_count}).\n"
+                f"Bill received \u2705 (#{new_count}).\n"
                 f"(Fetched media: {human_size})\n\n"
                 "Reply 'add another bill' to add more, 'list bills' to review, or 'that's all' to finish."
             )
         else:
             msg.body(
-                f"Bill received ✅ (#{new_count}).\n"
-                "Heads up: I couldn’t fetch the file from Twilio just now, but the link was saved. "
+                f"Bill received \u2705 (#{new_count}).\n"
+                "Heads up: I couldn't fetch the file from Twilio just now, but the link was saved. "
                 "You can try sending it again, or proceed.\n\n"
                 "Reply 'add another bill' to add more, 'list bills' to review, or 'that's all' to finish."
             )
         return str(resp)
 
+    # Fallbacks based on state
+    if state == "collecting":
+        msg.body(
+            "I'm ready — please send a photo/PDF of your bill.\n"
+            "Or say 'that's all' when you're finished."
+        )
+    elif state == "done":
+        if PUBLIC_BASE_URL:
+            digest_url = f"{PUBLIC_BASE_URL}/digest_preview?phone={quote(phone, safe='')}"
+            msg.body(f"You're done for now.\nPreview your digest any time: {digest_url}\nSay 'hi' to add more bills.")
+        else:
+            msg.body("You're done for now. Say 'hi' if you want to add more bills.")
+    else:
+        msg.body("Say 'hi' to get started with your bill upload.")
+    return str(resp)
 
 # -----------------------------
 # Admin/testing
