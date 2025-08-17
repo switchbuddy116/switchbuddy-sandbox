@@ -488,44 +488,35 @@ def fetch_tariffs_vic():
         {"name": "Daily Low",  "tariff_type": "FLAT", "supply_cents_per_day": 80,  "usage_cents_per_kwh": 36},
     ]
 
-def estimate_annual_cost(profile: dict, plan: dict) -> float:
-    total_kwh = float(profile.get("total_kwh") or 0)
-    start = profile.get("period_start")
-    end = profile.get("period_end")
+    plans = fetch_tariffs_vic()
+    scored = [{"plan": p, "annual_cost": estimate_annual_cost(latest_profile, p)} for p in plans]
+    scored.sort(key=lambda x: x["annual_cost"])
+    best = scored[0]
 
-    days = 62
-    try:
-        if start and end:
-            ds = datetime.fromisoformat(start)
-            de = datetime.fromisoformat(end)
-            days = max((de - ds).days, 1)
-    except Exception:
-        pass
+    # Build a "user current plan" adapter from the parsed bill to get a real baseline
+    user_plan = {
+        "tariff_type": (latest_profile.get("tariff_type") or "").upper(),
+        "supply_cents_per_day": latest_profile.get("supply_cents_per_day"),
+        "usage_cents_per_kwh": latest_profile.get("usage_cents_per_kwh"),
+        "peak_cents": latest_profile.get("usage_cents_per_kwh_peak"),
+        "shoulder_cents": latest_profile.get("usage_cents_per_kwh_shoulder"),
+        "offpeak_cents": latest_profile.get("usage_cents_per_kwh_offpeak"),
+        "usage_cents_per_kwh_step1": latest_profile.get("usage_cents_per_kwh_step1"),
+        "usage_cents_per_kwh_step2": latest_profile.get("usage_cents_per_kwh_step2"),
+    }
+    baseline_cost = estimate_annual_cost(latest_profile, user_plan) \
+        if latest_profile.get("supply_cents_per_day") is not None else scored[len(scored)//2]["annual_cost"]
 
-    daily_kwh = profile.get("daily_kwh")
-    if daily_kwh is None and total_kwh:
-        daily_kwh = total_kwh / days
-    if daily_kwh is None:
-        daily_kwh = 10
+    savings = round(baseline_cost - best["annual_cost"], 2)
 
-    annual_kwh = daily_kwh * 365
-    supply_cents = float(plan.get("supply_cents_per_day") or 0) * 365
-
-    if plan.get("tariff_type") == "FLAT":
-        usage_cents = annual_kwh * float(plan.get("usage_cents_per_kwh") or 0)
-    else:
-        peak = 0.5 * annual_kwh
-        shoulder = 0.3 * annual_kwh
-        offpeak = 0.2 * annual_kwh
-        usage_cents = (
-            peak * float(plan.get("peak_cents") or 0) +
-            shoulder * float(plan.get("shoulder_cents") or 0) +
-            offpeak * float(plan.get("offpeak_cents") or 0)
-        )
-
-    total_cents = supply_cents + usage_cents
-    return round(total_cents / 100.0, 2)
-
+    snapshot = {
+        "ts": int(time.time()),
+        "profile": latest_profile,
+        "ranked": scored,
+        "best": best,
+        "baseline_cost": baseline_cost,
+        "projected_savings": savings
+    }
 def compare_and_store(phone: str) -> dict:
     k_bills = f"user:{phone}:bills"
     raw_entries = r.lrange(k_bills, 0, -1) or []
@@ -553,20 +544,33 @@ def compare_and_store(phone: str) -> dict:
     plans = fetch_tariffs_vic()
     scored = [{"plan": p, "annual_cost": estimate_annual_cost(latest_profile, p)} for p in plans]
     scored.sort(key=lambda x: x["annual_cost"])
-
     best = scored[0]
-    median_cost = scored[len(scored)//2]["annual_cost"]
-    savings = round(median_cost - best["annual_cost"], 2)
+
+    # Build a "user current plan" adapter from the parsed bill to get a real baseline
+    user_plan = {
+        "tariff_type": (latest_profile.get("tariff_type") or "").upper(),
+        "supply_cents_per_day": latest_profile.get("supply_cents_per_day"),
+        "usage_cents_per_kwh": latest_profile.get("usage_cents_per_kwh"),
+        "peak_cents": latest_profile.get("usage_cents_per_kwh_peak"),
+        "shoulder_cents": latest_profile.get("usage_cents_per_kwh_shoulder"),
+        "offpeak_cents": latest_profile.get("usage_cents_per_kwh_offpeak"),
+        "usage_cents_per_kwh_step1": latest_profile.get("usage_cents_per_kwh_step1"),
+        "usage_cents_per_kwh_step2": latest_profile.get("usage_cents_per_kwh_step2"),
+    }
+    baseline_cost = estimate_annual_cost(latest_profile, user_plan) \
+        if latest_profile.get("supply_cents_per_day") is not None else scored[len(scored)//2]["annual_cost"]
+
+    savings = round(baseline_cost - best["annual_cost"], 2)
 
     snapshot = {
         "ts": int(time.time()),
         "profile": latest_profile,
         "ranked": scored,
         "best": best,
-        "baseline_cost": median_cost,
+        "baseline_cost": baseline_cost,
         "projected_savings": savings
     }
-    r.set(f"user:{phone}:last_comparison", json.dumps(snapshot))
+
     return snapshot
 
 # -----------------------------
