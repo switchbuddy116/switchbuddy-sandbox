@@ -338,7 +338,7 @@ def parse_bill_text(txt: str) -> dict:
     step2 = {}
     for i in range(len(lines)):
         # 3-line window to catch broken layouts
-        blob = " ".join(lines[i:j] for j in range(i, min(i + 3, len(lines))))
+        blob = " ".join(lines[i:min(i + 3, len(lines))])
         blob = lines[i] + " " + (lines[i + 1] if i + 1 < len(lines) else "") + " " + (lines[i + 2] if i + 2 < len(lines) else "")
         if not step1 and (step1_kw.search(lower[i]) or (i + 1 < len(lower) and step1_kw.search(lower[i + 1]))):
             k, r = _scan_step(blob)
