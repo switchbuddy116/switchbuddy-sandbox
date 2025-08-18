@@ -79,7 +79,7 @@ app = Flask(__name__)
 
 # One global place to set parser/build version
 
-PARSER_VERSION = "SBY-2025-08-18-parse6"
+PARSER_VERSION = "SBY-2025-08-18-parse7"
 
 @app.route("/parser_version", methods=["GET"])
 def parser_version():
@@ -1094,6 +1094,82 @@ def purge_bills():
     r.delete(f"user:{phone}:bill_count")
     r.delete(f"user:{phone}:last_comparison")
     return {"ok": True}, 200
+
+@app.route("/reparse_last_from_ocr", methods=["GET", "POST"])
+def reparse_last_from_ocr():
+    """
+    Re-parse the last saved bill for this phone using OCR text already stored
+    (ocr_excerpt). If not present, will try to re-download from Twilio and OCR.
+    Returns JSON with the new parsed block. Does NOT crash on common edge cases.
+    """
+    try:
+        phone = e164(request.args.get("phone", ""))
+        if not phone:
+            return {"error": "Missing ?phone=+E164 (encode + as %2B)"}, 400
+
+        k_bills = f"user:{phone}:bills"
+        last = r.lindex(k_bills, -1)
+        if not last:
+            return {"error": "No bills found for this phone."}, 404
+
+        if isinstance(last, bytes):
+            last = last.decode("utf-8", errors="ignore")
+
+        try:
+            j = json.loads(last)
+        except Exception as e:
+            return {"error": f"Corrupt last bill JSON: {type(e).__name__}: {e}", "raw": last[:400]}, 500
+
+        # Prefer the stored OCR text (fast, avoids expired Twilio URLs)
+        source_text = j.get("ocr_excerpt") or ""
+
+        # If no OCR text, try to re-download and OCR (may fail if Twilio URL expired)
+        if not source_text:
+            media_url = j.get("media_url")
+            media_type = j.get("media_type") or ""
+            if media_url:
+                try:
+                    content, fetched_type, _ = download_twilio_media(media_url)
+                    source_text = ocr_extract_text(content, fetched_type or media_type)
+                except Exception as ex:
+                    return {
+                        "error": "No ocr_excerpt on last bill and media re-download failed.",
+                        "details": f"{type(ex).__name__}: {ex}",
+                    }, 422
+            else:
+                return {"error": "No ocr_excerpt and no media_url on last bill record."}, 422
+
+        # Re-parse using the OCR text with the latest parser
+        new_parsed = parse_bill_text(source_text) if source_text else {}
+
+        # If we derived TIERED kWh parts but no total, sum them for convenience
+        if new_parsed and "total_kwh" not in new_parsed:
+            total = 0.0
+            for key in ("step1_kwh", "step2_kwh", "step3_kwh"):
+                if key in new_parsed:
+                    try:
+                        total += float(new_parsed[key])
+                    except Exception:
+                        pass
+            if total > 0:
+                new_parsed["total_kwh"] = round(total, 3)
+
+        # Save back to Redis
+        j["parsed"] = new_parsed
+        j["parser_version"] = PARSER_VERSION
+        r.lset(k_bills, -1, json.dumps(j))
+
+        # Also stash a comparison snapshot (optional, safe if it fails)
+        try:
+            r.set(f"user:{phone}:last_comparison", json.dumps(compare_and_store(phone)))
+        except Exception:
+            pass
+
+        return {"reparsed": new_parsed, "parser_version": PARSER_VERSION}, 200
+
+    except Exception as e:
+        # never 500 with a blank body — show something helpful
+        return {"error": f"Unexpected failure: {type(e).__name__}: {e}"}, 500
 
 
 # -----------------------------
