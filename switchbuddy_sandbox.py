@@ -1,4 +1,4 @@
-# switchbuddy_sandbox.py
+﻿# switchbuddy_sandbox.py
 
 import os
 import io
@@ -13,7 +13,12 @@ from flask import Flask, request, Response, redirect
 from twilio.twiml.messaging_response import MessagingResponse
 from upstash_redis import Redis
 
-PARSER_VERSION = "2025-08-18a"
+PARSER_VERSION = "2025-08-18a"  # at top of file once
+
+@app.route("/version", methods=["GET"])
+def version():
+    return {"parser_version": PARSER_VERSION}, 200
+
 
 
 # ----- Optional OCR libs -----
@@ -197,12 +202,12 @@ def parse_bill_text(txt: str) -> dict:
     """
     Robust tiered (Step 1 / Step 2) extraction under ugly OCR:
     - Accepts spaced variants like 'St e p 1' and 'k w h'
-    - Pairs <kWh> kWh with <rate> (c/$ per kWh) across wrapped lines (±5)
-    - Forces tariff_type='TIERED' when steps or ≥2 pairs are found
-    - Only calls TOU if ≥2 of {peak, shoulder, off-peak} found
+    - Pairs <kWh> kWh with <rate> (c/$ per kWh) across wrapped lines (Â±5)
+    - Forces tariff_type='TIERED' when steps or â‰¥2 pairs are found
+    - Only calls TOU if â‰¥2 of {peak, shoulder, off-peak} found
     """
     def _clean_num(s: str) -> float:
-        s = s.replace(",", "").replace("$", "").replace("€", "").replace("£", "")
+        s = s.replace(",", "").replace("$", "").replace("â‚¬", "").replace("Â£", "")
         try:
             return float(s)
         except Exception:
@@ -210,7 +215,7 @@ def parse_bill_text(txt: str) -> dict:
 
     def _to_cents(value: float, unit: str) -> float:
         unit = (unit or "").strip()
-        if unit in ("$", "usd", "aud", "nz$", "£", "€"):
+        if unit in ("$", "usd", "aud", "nz$", "Â£", "â‚¬"):
             return value * 100.0  # dollars -> cents
         return value
 
@@ -272,7 +277,7 @@ def parse_bill_text(txt: str) -> dict:
 
     # ---- Supply charge (per day)
     supply_pat = re.compile(
-        rf'(supply|daily)\s+(charge|service|fixed)[^0-9\n]{{0,40}}(?P<val>\d{{1,4}}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$)\s*(?:/|\bper\b)\s*(day|d)\b',
+        rf'(supply|daily)\s+(charge|service|fixed)[^0-9\n]{{0,40}}(?P<val>\d{{1,4}}(?:\.\d+)?)\s*(?P<unit>[cÂ¢]|\$)\s*(?:/|\bper\b)\s*(day|d)\b',
         re.IGNORECASE
     )
     for ln in lines:
@@ -285,7 +290,7 @@ def parse_bill_text(txt: str) -> dict:
     step1_idxs = [i for i, ns in enumerate(nospace_lower) if "step1" in ns]
     step2_idxs = [i for i, ns in enumerate(nospace_lower) if "step2" in ns]
 
-    rate_pat = re.compile(rf'(?P<r>\d{{1,4}}(?:\.\d+)?)\s*(?P<u>[c¢]|\$)\s*(?:/|\bper\b)\s*{KWH_WORD}', re.IGNORECASE)
+    rate_pat = re.compile(rf'(?P<r>\d{{1,4}}(?:\.\d+)?)\s*(?P<u>[cÂ¢]|\$)\s*(?:/|\bper\b)\s*{KWH_WORD}', re.IGNORECASE)
     kwh_only_pat = kwh_token_pat  # reuse
 
     def _nearest_match(pat, idx, span=5):
@@ -322,8 +327,8 @@ def parse_bill_text(txt: str) -> dict:
 
     # ---- Also scan for general kWh@rate pairs anywhere (inline or wrapped)
     pair_inline = re.compile(
-        rf'(?P<k>\d{{1,6}}(?:[,\d]{{0,6}})?(?:\.\d+)?)\s*{KWH_WORD}[^@\n]{{0,120}}(?:@|at|x|×)\s*'
-        rf'(?P<r>\d{{1,4}}(?:\.\d+)?)\s*(?P<u>[c¢]|\$)\s*(?:/|\bper\b)\s*{KWH_WORD}',
+        rf'(?P<k>\d{{1,6}}(?:[,\d]{{0,6}})?(?:\.\d+)?)\s*{KWH_WORD}[^@\n]{{0,120}}(?:@|at|x|Ã—)\s*'
+        rf'(?P<r>\d{{1,4}}(?:\.\d+)?)\s*(?P<u>[cÂ¢]|\$)\s*(?:/|\bper\b)\s*{KWH_WORD}',
         re.IGNORECASE
     )
     pairs = []
@@ -380,9 +385,9 @@ def parse_bill_text(txt: str) -> dict:
     if pair_sum > 0 and (("total_kwh" not in out) or (pair_sum > float(out["total_kwh"]) + 0.5)):
         out["total_kwh"] = pair_sum
 
-    # ---- TOU fallback ONLY if still unset and we see ≥2 TOU categories
+    # ---- TOU fallback ONLY if still unset and we see â‰¥2 TOU categories
     if out.get("tariff_type") is None:
-        rate_any = rf'(?P<val>\d{{1,4}}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$)\s*(?:/|\bper\b)\s*{KWH_WORD}'
+        rate_any = rf'(?P<val>\d{{1,4}}(?:\.\d+)?)\s*(?P<unit>[cÂ¢]|\$)\s*(?:/|\bper\b)\s*{KWH_WORD}'
         tou_specs = [
             ("usage_cents_per_kwh_peak", re.compile(r'peak[^.\n]*?' + rate_any, re.IGNORECASE)),
             ("usage_cents_per_kwh_shoulder", re.compile(r'shoulder[^.\n]*?' + rate_any, re.IGNORECASE)),
@@ -475,7 +480,7 @@ def version():
 
 @app.route("/_debug/parser", methods=["GET"])
 def debug_parser():
-    # Returns the first few lines of the active parser, so we can confirm it’s the new one
+    # Returns the first few lines of the active parser, so we can confirm itâ€™s the new one
     src = inspect.getsource(parse_bill_text)
     preview = "\n".join(src.splitlines()[:20])
     return {
@@ -517,7 +522,7 @@ def force_reparse():
     except Exception as e:
         return {"error": f"Re-download failed: {type(e).__name__}: {e}"}, 502
 
-    # Parse with the code that’s live right now
+    # Parse with the code thatâ€™s live right now
     parsed = parse_bill_bytes(content, fetched_type or (media_type or ""))
     ocr_text = ocr_extract_text(content, fetched_type or (media_type or "")) or ""
     ocr_excerpt = ocr_text[:2000] if ocr_text else None
@@ -559,11 +564,6 @@ def get_session():
 
 # --- Debug: version ping ---
 VERSION = "SBY-2025-08-17-parse2"
-
-@app.route("/version", methods=["GET"])
-def version():
-    return {"parser_version": PARSER_VERSION}, 200
-
 
 
 
@@ -626,10 +626,10 @@ def whatsapp_webhook():
             "Hi! I'm SwitchBuddy.\n\n"
             "Please send a photo or PDF of your electricity bill.\n\n"
             "When you're finished:\n"
-            "• Reply: 'add another bill' to upload more\n"
-            "• Reply: 'that's all' to finish\n"
-            "• Reply: 'list bills' to see what I've saved\n"
-            "• Reply: 'digest' to get your weekly digest link"
+            "â€¢ Reply: 'add another bill' to upload more\n"
+            "â€¢ Reply: 'that's all' to finish\n"
+            "â€¢ Reply: 'list bills' to see what I've saved\n"
+            "â€¢ Reply: 'digest' to get your weekly digest link"
         )
         return str(resp)
 
@@ -688,7 +688,7 @@ def whatsapp_webhook():
 
     if said_any("add another bill", "add another", "another bill", "add more", "upload another"):
         r.set(k_state, "collecting")
-        msg.body("Cool — send the next bill photo/PDF. When finished, say 'that's all'.")
+        msg.body("Cool â€” send the next bill photo/PDF. When finished, say 'that's all'.")
         return str(resp)
 
     # Media handling (Twilio sends MediaUrl0/MediaContentType0 when files attached)
@@ -754,13 +754,13 @@ def whatsapp_webhook():
                 human_size = f"{size_bytes/1024/1024:.2f} MB"
 
             msg.body(
-                f"Bill received ✅ (#{new_count}).\n"
+                f"Bill received âœ… (#{new_count}).\n"
                 f"(Fetched media: {human_size})\n\n"
                 "Reply 'add another bill' to add more, 'list bills' to review, or 'that's all' to finish."
             )
         else:
             msg.body(
-                f"Bill received ✅ (#{new_count}).\n"
+                f"Bill received âœ… (#{new_count}).\n"
                 "Heads up: I couldn't fetch the file from Twilio just now, but the link was saved. "
                 "You can try sending it again, or proceed.\n\n"
                 "Reply 'add another bill' to add more, 'list bills' to review, or 'that's all' to finish."
@@ -770,7 +770,7 @@ def whatsapp_webhook():
     # Fallbacks based on state
     if state == "collecting":
         msg.body(
-            "I'm ready — please send a photo/PDF of your bill.\n"
+            "I'm ready â€” please send a photo/PDF of your bill.\n"
             "Or say 'that's all' when you're finished."
         )
     elif state == "done":
@@ -878,3 +878,4 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     print(f"Starting SwitchBuddy on http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)
+
