@@ -77,12 +77,23 @@ if _HAS_GCV:
 # -----------------------------
 app = Flask(__name__)
 
+@app.route("/_routes", methods=["GET"], endpoint="_routes_dump")
+def _routes_dump():
+    routes = []
+    for r in app.url_map.iter_rules():
+        methods = sorted(m for m in r.methods if m not in {"HEAD", "OPTIONS"})
+        routes.append({"rule": str(r.rule), "endpoint": r.endpoint, "methods": methods})
+    return {"routes": routes}, 200
+
+
 # One global place to set parser/build version
 
 PARSER_VERSION = "SBY-2025-08-18-parse7"
 
-@app.route("/parser_version", methods=["GET"])
-def parser_version():
+# version ping
+@app.route("/version", methods=["GET"], endpoint="version_ping")
+def version():
+
     return {"parser_version": PARSER_VERSION}, 200
 
 
@@ -1044,45 +1055,6 @@ def last_bill():
     except Exception:
         return {"phone": phone, "last_bill": {"raw": str(last)}}, 200
 
-@app.route("/reparse_last_from_ocr", methods=["POST", "GET"])
-def reparse_last_from_ocr():
-    phone = e164(request.args.get("phone", "") or request.values.get("phone", ""))
-    if not phone:
-        return {"error": "Missing ?phone=E164 (encode + as %2B)"}, 400
-
-    k_bills = f"user:{phone}:bills"
-    entries = r.lrange(k_bills, 0, -1) or []
-    if not entries:
-        return {"error": "No bills saved for this phone"}, 404
-
-    idx = len(entries) - 1
-    last = entries[idx]
-    if isinstance(last, bytes):
-        last = last.decode("utf-8", errors="ignore")
-    try:
-        j = json.loads(last)
-    except Exception:
-        return {"error": "Last bill is not valid JSON"}, 500
-
-    ocr = j.get("ocr_excerpt") or ""
-    if not ocr:
-        return {"error": "Last bill has no ocr_excerpt stored; upload again once to populate it"}, 409
-
-    # Re-run the CURRENT parser on the stored OCR text
-    new_parsed = parse_bill_text(ocr)
-    j["parsed"] = new_parsed
-    j["parser_version"] = PARSER_VERSION
-
-    # Write back into the list at the same index
-    r.lset(k_bills, idx, json.dumps(j))
-
-    # Refresh comparison snapshot based on latest parsed bill
-    try:
-        compare_and_store(phone)
-    except Exception:
-        pass
-
-    return {"reparsed": new_parsed, "parser_version": PARSER_VERSION}, 200
 
 @app.route("/purge_bills", methods=["POST", "GET"])
 def purge_bills():
