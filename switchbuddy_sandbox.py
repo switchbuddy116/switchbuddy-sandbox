@@ -80,9 +80,12 @@ app = Flask(__name__)
 # One global place to set parser/build version
 PARSER_VERSION = "2025-08-18b"
 
-@app.route("/version", methods=["GET"])
-def version():
+PARSER_VERSION = "2025-08-18c"
+
+@app.route("/parser_version", methods=["GET"])
+def parser_version():
     return {"parser_version": PARSER_VERSION}, 200
+
 
 # -----------------------------
 # Helpers
@@ -430,6 +433,204 @@ def parse_bill_text(txt: str) -> dict:
             pass
 
     return out
+
+# ---------- Bytes -> structured bill profile ----------
+def parse_bill_bytes(content: bytes, content_type: str) -> dict:
+    """
+    Extract text from PDF/image bytes, parse with parse_bill_text,
+    and fall back to a tiny demo profile if OCR found nothing.
+    """
+    txt = ocr_extract_text(content, content_type)
+    parsed = parse_bill_text(txt) if txt else {}
+
+    if parsed:
+        # Be conservative: if tariff_type is still unset, default to FLAT rather than TOU.
+        parsed.setdefault("tariff_type", parsed.get("tariff_type") or "FLAT")
+        return parsed
+
+    # Fallback so the pipeline still runs
+    return {
+        "period_start": "2025-06-01",
+        "period_end": "2025-08-01",
+        "total_kwh": 1200,
+        "daily_kwh": round(1200 / 62, 2),
+        "supply_cents_per_day": 95,
+        "usage_cents_per_kwh": 32,
+        "tariff_type": "FLAT",
+        "total_cost_inc_gst": 540.00,
+    }
+
+
+# ---------- Digest HTML (simple) ----------
+def _build_digest_html(phone: str) -> str:
+    k_bills = f"user:{phone}:bills"
+    entries = r.lrange(k_bills, 0, -1) or []
+    total_bills = len(entries)
+
+    preview_items = []
+    for raw in entries[-5:]:
+        try:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="ignore")
+            j = json.loads(raw)
+        except Exception:
+            j = {"media_type": "unknown", "ts": 0}
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(j.get("ts", 0)))
+        mtype = (j.get("media_type") or "").split("/")[-1].upper()
+        preview_items.append(f"<li>{when} — {mtype or 'UNKNOWN'}</li>")
+
+    savings = 100.0
+    try:
+        q = request.args.get("savings")
+        if q:
+            savings = float(q)
+    except Exception:
+        pass
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>SwitchBuddy Weekly Digest</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color:#0f172a; margin:0; }}
+    .wrap {{ max-width: 720px; margin: 0 auto; padding: 24px; }}
+    .card {{ background:#fff; border:1px solid #e2e8f0; border-radius:12px; padding:20px; box-shadow:0 1px 2px rgba(0,0,0,0.03); }}
+    h1 {{ font-size: 22px; margin:0 0 8px }}
+    h2 {{ font-size: 18px; margin:16px 0 8px }}
+    p  {{ margin: 8px 0 }}
+    .cta {{ display:inline-block; padding:10px 14px; border-radius:10px; text-decoration:none; border:1px solid #0ea5e9; }}
+    .cta-primary {{ background:#0ea5e9; color:white; border-color:#0ea5e9; }}
+    ul {{ margin:8px 0 0 18px }}
+    .muted {{ color:#64748b }}
+    .grid {{ display:grid; gap:12px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }}
+    .panel {{ border:1px solid #e2e8f0; border-radius:10px; padding:12px; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>⚡ SwitchBuddy — Weekly Digest</h1>
+      <p class="muted">Phone: {phone}</p>
+
+      <div class="grid">
+        <div class="panel">
+          <h2>Summary</h2>
+          <p>Saved bills on file: <strong>{total_bills}</strong></p>
+          <p>Projected annual savings: <strong>${savings:,.0f}</strong></p>
+        </div>
+
+        <div class="panel">
+          <h2>Latest uploads</h2>
+          {("<ul>" + "".join(preview_items) + "</ul>") if preview_items else "<p class='muted'>No recent bills.</p>"}
+        </div>
+      </div>
+
+      <h2 style="margin-top:16px">Recommendation</h2>
+      <p>Based on your recent usage and current market rates, you look suited to a <strong>low daily charge</strong> plan.</p>
+      <p class="muted">(*Demo text*) This will refine once TOU/tiers are parsed from your bills.</p>
+
+      <p style="margin-top:16px">
+        <a class="cta cta-primary" href="#">Switch plan</a>
+        <a class="cta" href="#">See full comparison</a>
+      </p>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+# ---------- Comparison stubs (so 'that’s all' & digest work) ----------
+def fetch_tariffs_vic():
+    return [
+        {"name": "Flat Saver", "tariff_type": "FLAT", "supply_cents_per_day": 105, "usage_cents_per_kwh": 32},
+        {"name": "TOU Value",  "tariff_type": "TOU",  "supply_cents_per_day": 95,  "peak_cents": 42, "shoulder_cents": 28, "offpeak_cents": 20},
+        {"name": "Daily Low",  "tariff_type": "FLAT", "supply_cents_per_day": 80,  "usage_cents_per_kwh": 36},
+    ]
+
+
+def estimate_annual_cost(profile: dict, plan: dict) -> float:
+    total_kwh = float(profile.get("total_kwh") or 0)
+    start = profile.get("period_start")
+    end = profile.get("period_end")
+
+    days = 62
+    try:
+        if start and end:
+            ds = datetime.fromisoformat(start)
+            de = datetime.fromisoformat(end)
+            days = max((de - ds).days, 1)
+    except Exception:
+        pass
+
+    daily_kwh = profile.get("daily_kwh")
+    if daily_kwh is None and total_kwh:
+        daily_kwh = total_kwh / days
+    if daily_kwh is None:
+        daily_kwh = 10
+
+    annual_kwh = daily_kwh * 365
+    supply_cents = float(plan.get("supply_cents_per_day") or 0) * 365
+
+    if plan.get("tariff_type") == "FLAT":
+        usage_cents = annual_kwh * float(plan.get("usage_cents_per_kwh") or 0)
+    else:
+        peak = 0.5 * annual_kwh
+        shoulder = 0.3 * annual_kwh
+        offpeak = 0.2 * annual_kwh
+        usage_cents = (
+            peak * float(plan.get("peak_cents") or 0) +
+            shoulder * float(plan.get("shoulder_cents") or 0) +
+            offpeak * float(plan.get("offpeak_cents") or 0)
+        )
+
+    total_cents = supply_cents + usage_cents
+    return round(total_cents / 100.0, 2)
+
+
+def compare_and_store(phone: str) -> dict:
+    k_bills = f"user:{phone}:bills"
+    raw_entries = r.lrange(k_bills, 0, -1) or []
+
+    latest_profile = None
+    for raw in reversed(raw_entries):
+        try:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="ignore")
+            j = json.loads(raw)
+            if j.get("parsed"):
+                latest_profile = j["parsed"]
+                break
+        except Exception:
+            pass
+
+    if not latest_profile:
+        latest_profile = {
+            "total_kwh": 1200,
+            "period_start": "2025-06-01",
+            "period_end": "2025-08-01",
+            "daily_kwh": round(1200/62, 2),
+        }
+
+    plans = fetch_tariffs_vic()
+    scored = [{"plan": p, "annual_cost": estimate_annual_cost(latest_profile, p)} for p in plans]
+    scored.sort(key=lambda x: x["annual_cost"])
+
+    best = scored[0]
+    median_cost = scored[len(scored)//2]["annual_cost"]
+    savings = round(median_cost - best["annual_cost"], 2)
+
+    snapshot = {
+        "ts": int(time.time()),
+        "profile": latest_profile,
+        "ranked": scored,
+        "best": best,
+        "baseline_cost": median_cost,
+        "projected_savings": savings
+    }
+    r.set(f"user:{phone}:last_comparison", json.dumps(snapshot))
+    return snapshot
 
 
 # -----------------------------
