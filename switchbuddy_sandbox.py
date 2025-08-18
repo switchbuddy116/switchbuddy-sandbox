@@ -79,7 +79,7 @@ app = Flask(__name__)
 
 # One global place to set parser/build version
 
-PARSER_VERSION = "SBY-2025-08-18-parse3"
+PARSER_VERSION = "SBY-2025-08-18-parse5"
 
 @app.route("/parser_version", methods=["GET"])
 def parser_version():
@@ -202,236 +202,269 @@ def ocr_extract_text(content: bytes, content_type: str) -> str:
 
 def parse_bill_text(txt: str) -> dict:
     """
-    Robust tiered (Step 1 / Step 2) extraction under ugly OCR:
-    - Accepts spaced variants like 'St e p 1' and 'k w h'
-    - Pairs <kWh> kWh with <rate> (c/$ per kWh) across wrapped lines (Â±5)
-    - Forces tariff_type='TIERED' when steps or â‰¥2 pairs are found
-    - Only calls TOU if â‰¥2 of {peak, shoulder, off-peak} found
+    Parse a block of bill text into structured fields.
+    Priority:
+      1) TIERED blocks (Step/First/Next/Remaining)   -> tariff_type=TIERED
+      2) TOU (peak/shoulder/off-peak) BUT only if >=2 distinct TOU rates found
+      3) FLAT/anytime as fallback
+    Money total prefers 'New charges', 'Total for this bill', 'Amount due'.
     """
+    import re
+    from datetime import datetime
+
+    # -------- helpers --------
     def _clean_num(s: str) -> float:
-        s = s.replace(",", "").replace("$", "").replace("â‚¬", "").replace("Â£", "")
+        s = s.replace(",", "").replace("$", "").replace("€", "").replace("£", "")
         try:
             return float(s)
         except Exception:
             return 0.0
 
     def _to_cents(value: float, unit: str) -> float:
-        unit = (unit or "").strip()
-        if unit in ("$", "usd", "aud", "nz$", "Â£", "â‚¬"):
-            return value * 100.0  # dollars -> cents
+        unit = (unit or "").strip().lower()
+        if unit in ("$", "aud", "usd", "nz$", "£", "€"):
+            return value * 100.0
+        # treat c / ¢ as already cents
         return value
 
-    # ---- Normalise and index lines
+    # Normalise whitespace and split
     txt_norm = re.sub(r"[ \t]+", " ", txt)
     lines = [ln.strip() for ln in txt_norm.splitlines() if ln.strip()]
     lower = [ln.lower() for ln in lines]
-    # no-spaces variant to catch 'step1' and 'step2'
-    nospace_lower = [re.sub(r"\s+", "", ln).lower() for ln in lines]
 
-    out: dict = {}
+    result: dict = {}
 
-    # ---- Period (same as before, but compact)
+    # -------- 1) Billing period --------
     date_pat = re.compile(r"(?P<d>\d{1,2})[\/\-\s](?P<m>\d{1,2}|[A-Za-z]{3,9})[\/\-\s](?P<y>\d{2,4})", re.IGNORECASE)
-    month_map = {'jan':1,'january':1,'feb':2,'february':2,'mar':3,'march':3,'apr':4,'april':4,
-                 'may':5,'jun':6,'june':6,'jul':7,'july':7,'aug':8,'august':8,'sep':9,'sept':9,'september':9,
-                 'oct':10,'october':10,'nov':11,'november':11,'dec':12,'december':12}
+    month_map = {
+        'jan':1,'january':1,'feb':2,'february':2,'mar':3,'march':3,'apr':4,'april':4,
+        'may':5,'jun':6,'june':6,'jul':7,'july':7,'aug':8,'august':8,'sep':9,'sept':9,'september':9,
+        'oct':10,'october':10,'nov':11,'november':11,'dec':12,'december':12
+    }
+
     def _parse_date(m):
-        d = int(m.group("d")); mm = m.group("m"); y = int(m.group("y"));  y += 2000 if y < 100 else 0
-        mo = int(mm) if mm.isdigit() else month_map.get(mm.lower(), 1)
+        d = int(m.group("d"))
+        mm = m.group("m")
+        y = int(m.group("y"))
+        if y < 100:
+            y += 2000
+        if mm.isdigit():
+            mo = int(mm)
+        else:
+            mo = month_map.get(mm.lower(), 1)
         try:
             return datetime(y, mo, d)
         except Exception:
             return None
+
     period_found = False
     for i, ln in enumerate(lower):
-        if any(k in ln for k in ("billing period", "for the period", "supply period", "usage period", "period from")) or (" from " in ln and " to " in ln):
-            ms = list(date_pat.finditer(lines[i]))
-            if len(ms) >= 2:
-                ds, de = _parse_date(ms[0]), _parse_date(ms[-1])
+        if any(k in ln for k in ("billing period", "for the period", "supply period", "usage period", "period from")):
+            m_all = list(date_pat.finditer(lines[i]))
+            if len(m_all) >= 2:
+                ds, de = _parse_date(m_all[0]), _parse_date(m_all[-1])
                 if ds and de and de >= ds:
-                    out["period_start"] = ds.date().isoformat()
-                    out["period_end"] = de.date().isoformat()
+                    result["period_start"] = ds.date().isoformat()
+                    result["period_end"] = de.date().isoformat()
                     period_found = True
                     break
+        if " from " in ln and " to " in ln:
+            m_all = list(date_pat.finditer(lines[i]))
+            if len(m_all) >= 2:
+                ds, de = _parse_date(m_all[0]), _parse_date(m_all[-1])
+                if ds and de and de >= ds:
+                    result["period_start"] = ds.date().isoformat()
+                    result["period_end"] = de.date().isoformat()
+                    period_found = True
+                    break
+
     if not period_found:
+        # Loose fallback across 'period/from/to' lines
         candidates = []
         for i, ln in enumerate(lower):
             if "period" in ln or " from " in ln or " to " in ln:
                 for m in date_pat.finditer(lines[i]):
                     d = _parse_date(m)
-                    if d: candidates.append((i, d))
+                    if d:
+                        candidates.append((i, d))
         if len(candidates) >= 2:
             candidates.sort(key=lambda x: (x[0], x[1]))
-            ds = candidates[0][1]; de = max(candidates, key=lambda x: x[1])[1]
+            ds = candidates[0][1]
+            de = max(candidates, key=lambda x: x[1])[1]
             if ds and de and de >= ds:
-                out["period_start"] = ds.date().isoformat()
-                out["period_end"] = de.date().isoformat()
+                result["period_start"] = ds.date().isoformat()
+                result["period_end"] = de.date().isoformat()
 
-    # ---- Generic headline total kWh if present
-    KWH_WORD = r'k\W*?w\W*?h'  # matches kwh / k w h / kW h ...
-    kwh_token_pat = re.compile(rf'(?<![\d\.])(?P<k>\d{{1,6}}(?:[,\d]{{0,6}})?(?:\.\d+)?)\s*{KWH_WORD}\b', re.IGNORECASE)
+    # -------- 2) Bill total (prefer explicit labels) --------
+    money_on_line = re.compile(r"\$\s*(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)")
+    preferred_keys = ("new charges", "total for this bill", "charges this bill", "amount due", "total balance")
+    amounts = []
     for i, ln in enumerate(lower):
-        if any(k in ln for k in ("total usage", "electricity used", "usage this bill", "total kwh", "energy used", "your usage")):
-            m = kwh_token_pat.search(lines[i])
-            if m:
-                out["total_kwh"] = round(_clean_num(m.group("k")), 3)
+        if any(k in ln for k in preferred_keys):
+            # same line first
+            for m in money_on_line.finditer(lines[i]):
+                amt = _clean_num(m.group(1))
+                if amt > 0:
+                    amounts.append((i, amt))
+            # look-ahead one line (label on one line, value on next)
+            if i + 1 < len(lines):
+                for m in money_on_line.finditer(lines[i + 1]):
+                    amt = _clean_num(m.group(1))
+                    if amt > 0:
+                        amounts.append((i + 1, amt))
+    if amounts:
+        best = max(amounts, key=lambda x: x[1])[1]
+        result["total_cost_inc_gst"] = round(best, 2)
+    else:
+        # guarded fallback: only amounts with a $ sign anywhere
+        all_amts = [_clean_num(m.group(1)) for m in money_on_line.finditer(txt)]
+        if all_amts:
+            result["total_cost_inc_gst"] = round(max(all_amts), 2)
+
+    # -------- 3) TIERED blocks (handled BEFORE TOU) --------
+    # Windows of 1–2 lines to catch "Step 1", "first", "next", "remaining" patterns.
+    step_kw = re.compile(r"\b(step\s*1|first|block\s*1)\b", re.IGNORECASE)
+    step2_kw = re.compile(r"\b(step\s*2|next|remaining|thereafter|block\s*2)\b", re.IGNORECASE)
+    kwh_pat = re.compile(r"(?<![\d\.])(\d{1,6}(?:\.\d+)?)\s*kwh\b", re.IGNORECASE)
+    rate_pat = re.compile(r"(\d{1,4}(?:\.\d+)?)\s*([c¢]|\$)\s*\/?\s*kwh", re.IGNORECASE)
+
+    step1 = {}
+    step2 = {}
+    # Slide a 2-line window
+    for i in range(len(lines)):
+        win = lines[i]
+        win_l = lower[i]
+        win2 = (lines[i + 1] if i + 1 < len(lines) else "")
+        win2_l = win2.lower()
+
+        # Step 1-like window
+        if step_kw.search(win_l) or step_kw.search(win2_l):
+            # prefer to find kWh/rate in combined text
+            blob = f"{win} {win2}"
+            m_kwh = kwh_pat.search(blob)
+            m_rate = rate_pat.search(blob)
+            if m_kwh:
+                step1["kwh"] = _clean_num(m_kwh.group(1))
+            if m_rate:
+                step1["rate_cents"] = round(_to_cents(_clean_num(m_rate.group(1)), m_rate.group(2)), 4)
+
+        # Step 2-like window
+        if step2_kw.search(win_l) or step2_kw.search(win2_l):
+            blob = f"{win} {win2}"
+            m_kwh = kwh_pat.search(blob)
+            m_rate = rate_pat.search(blob)
+            if m_kwh:
+                step2["kwh"] = _clean_num(m_kwh.group(1))
+            if m_rate:
+                step2["rate_cents"] = round(_to_cents(_clean_num(m_rate.group(1)), m_rate.group(2)), 4)
+
+    # If any step info found, mark TIERED and populate
+    if step1 or step2:
+        result["tariff_type"] = "TIERED"
+        if "rate_cents" in step1:
+            result["usage_cents_per_kwh_step1"] = step1["rate_cents"]
+        if "kwh" in step1:
+            result["step1_kwh"] = step1["kwh"]
+        if "rate_cents" in step2:
+            result["usage_cents_per_kwh_step2"] = step2["rate_cents"]
+        if "kwh" in step2:
+            result["step2_kwh"] = step2["kwh"]
+
+    # -------- 4) TOU (require >= 2 distinct TOU rates to avoid false positives) --------
+    if "tariff_type" not in result:
+        rate_any = r"(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$)\s*\/?\s*kwh"
+        tou_specs = [
+            ("usage_cents_per_kwh_peak", re.compile(r"\bpeak\b[^.\n]*?" + rate_any, re.IGNORECASE)),
+            ("usage_cents_per_kwh_shoulder", re.compile(r"\bshoulder\b[^.\n]*?" + rate_any, re.IGNORECASE)),
+            ("usage_cents_per_kwh_offpeak", re.compile(r"(?:off-?peak|off\s*peak)[^.\n]*?" + rate_any, re.IGNORECASE)),
+        ]
+        found = 0
+        for key, pat in tou_specs:
+            for ln in lines:
+                m = pat.search(ln)
+                if m:
+                    val = _to_cents(float(m.group("val")), m.group("unit"))
+                    result[key] = round(val, 4)
+                    found += 1
+                    break
+        if found >= 2:
+            result["tariff_type"] = "TOU"
+
+    # -------- 5) FLAT/anytime fallback --------
+    if "tariff_type" not in result:
+        flat_pats = [
+            re.compile(r"(anytime|single\s*rate|general|flat|usage|energy)[^.\n]*?(\d{1,4}(?:\.\d+)?)\s*([c¢]|\$)\s*\/?\s*kwh", re.IGNORECASE),
+        ]
+        for pat in flat_pats:
+            for ln in lines:
+                m = pat.search(ln)
+                if m:
+                    val = _to_cents(float(m.group(2)), m.group(3))
+                    result["tariff_type"] = "FLAT"
+                    result["usage_cents_per_kwh"] = round(val, 4)
+                    break
+            if "usage_cents_per_kwh" in result:
                 break
 
-    # ---- Supply charge (per day)
+    # -------- 6) Supply charge (c/day or $/day) --------
     supply_pat = re.compile(
-        rf'(supply|daily)\s+(charge|service|fixed)[^0-9\n]{{0,40}}(?P<val>\d{{1,4}}(?:\.\d+)?)\s*(?P<unit>[cÂ¢]|\$)\s*(?:/|\bper\b)\s*(day|d)\b',
-        re.IGNORECASE
+        r"(supply|daily)\s+(charge|service|fixed)[^.\n]*?(\d{1,4}(?:\.\d+)?)\s*([c¢]|\$)\s*\/?\s*(day|d)\b",
+        re.IGNORECASE,
     )
     for ln in lines:
         m = supply_pat.search(ln)
         if m:
-            out["supply_cents_per_day"] = round(_to_cents(float(m.group("val")), m.group("unit")), 4)
+            result["supply_cents_per_day"] = round(_to_cents(float(m.group(3)), m.group(4)), 4)
             break
 
-    # ---- Tier extraction (Step 1 / Step 2) with window pairing
-    step1_idxs = [i for i, ns in enumerate(nospace_lower) if "step1" in ns]
-    step2_idxs = [i for i, ns in enumerate(nospace_lower) if "step2" in ns]
+    # -------- 7) Total kWh for this bill --------
+    total_kwh = None
+    # Preferred labels
+    kwh_pref = re.compile(r"(total usage|usage this bill|electricity used|total kwh|energy used)", re.IGNORECASE)
+    kwh_num = re.compile(r"(?<![\d\.])(\d{1,6}(?:\.\d+)?)\s*kwh\b", re.IGNORECASE)
 
-    rate_pat = re.compile(rf'(?P<r>\d{{1,4}}(?:\.\d+)?)\s*(?P<u>[cÂ¢]|\$)\s*(?:/|\bper\b)\s*{KWH_WORD}', re.IGNORECASE)
-    kwh_only_pat = kwh_token_pat  # reuse
-
-    def _nearest_match(pat, idx, span=5):
-        for dist in range(0, span + 1):
-            for j in ([idx] if dist == 0 else [idx - dist, idx + dist]):
-                if 0 <= j < len(lines):
-                    m = pat.search(lines[j])
-                    if m:
-                        return m
-        return None
-
-    def _extract_step(idx):
-        mk = _nearest_match(kwh_only_pat, idx, span=5)
-        mr = _nearest_match(rate_pat, idx, span=5)
-        k = _clean_num(mk.group("k")) if mk else None
-        r_val = _clean_num(mr.group("r")) if mr else None
-        r_unit = (mr.group("u") if mr else "c")
-        r_cents = _to_cents(r_val, r_unit) if r_val is not None else None
-        return (k, r_cents)
-
-    found_pairs = []
-
-    if step1_idxs:
-        k, r_c = _extract_step(step1_idxs[0])
-        if k: out["step1_kwh"] = round(k, 3)
-        if r_c is not None: out["usage_cents_per_kwh_step1"] = round(r_c, 3)
-        if k and r_c is not None: found_pairs.append((k, r_c))
-
-    if step2_idxs:
-        k, r_c = _extract_step(step2_idxs[0])
-        if k: out["step2_kwh"] = round(k, 3)
-        if r_c is not None: out["usage_cents_per_kwh_step2"] = round(r_c, 3)
-        if k and r_c is not None: found_pairs.append((k, r_c))
-
-    # ---- Also scan for general kWh@rate pairs anywhere (inline or wrapped)
-    pair_inline = re.compile(
-        rf'(?P<k>\d{{1,6}}(?:[,\d]{{0,6}})?(?:\.\d+)?)\s*{KWH_WORD}[^@\n]{{0,120}}(?:@|at|x|Ã—)\s*'
-        rf'(?P<r>\d{{1,4}}(?:\.\d+)?)\s*(?P<u>[cÂ¢]|\$)\s*(?:/|\bper\b)\s*{KWH_WORD}',
-        re.IGNORECASE
-    )
-    pairs = []
-
-    # same-line
-    for ln in lines:
-        for m in pair_inline.finditer(ln):
-            k = _clean_num(m.group("k"))
-            r_c = _to_cents(_clean_num(m.group("r")), m.group("u"))
-            if k > 0 and r_c > 0:
-                pairs.append((k, r_c))
-
-    # two-line / three-line blobs
-    for i in range(len(lines) - 1):
-        blob2 = lines[i] + " " + lines[i+1]
-        m2 = pair_inline.search(blob2)
-        if m2:
-            k = _clean_num(m2.group("k"))
-            r_c = _to_cents(_clean_num(m2.group("r")), m2.group("u"))
-            if k > 0 and r_c > 0:
-                pairs.append((k, r_c))
-    for i in range(len(lines) - 2):
-        blob3 = lines[i] + " " + lines[i+1] + " " + lines[i+2]
-        m3 = pair_inline.search(blob3)
-        if m3:
-            k = _clean_num(m3.group("k"))
-            r_c = _to_cents(_clean_num(m3.group("r")), m3.group("u"))
-            if k > 0 and r_c > 0:
-                pairs.append((k, r_c))
-
-    # De-dup near-identical
-    dedup = []
-    for k, r_c in pairs:
-        if not any(abs(k - k2) < 0.01 and abs(r_c - r2) < 0.01 for (k2, r2) in dedup):
-            dedup.append((k, r_c))
-    pairs = dedup
-
-    # If we have explicit steps missing but found pairs, fill step1/2 by order
-    if pairs:
-        if "step1_kwh" not in out and len(pairs) >= 1:
-            out["step1_kwh"] = round(pairs[0][0], 3)
-            out["usage_cents_per_kwh_step1"] = round(pairs[0][1], 3)
-        if "step2_kwh" not in out and len(pairs) >= 2:
-            out["step2_kwh"] = round(pairs[1][0], 3)
-            out["usage_cents_per_kwh_step2"] = round(pairs[1][1], 3)
-        found_pairs.extend(pairs[:2])
-
-    # Decide tariff type based on steps/pairs first
-    if step1_idxs or step2_idxs or len(found_pairs) >= 2:
-        out["tariff_type"] = "TIERED"
-
-    # Derive total_kwh from steps if better
-    pair_sum = round((out.get("step1_kwh") or 0.0) + (out.get("step2_kwh") or 0.0), 3)
-    if pair_sum > 0 and (("total_kwh" not in out) or (pair_sum > float(out["total_kwh"]) + 0.5)):
-        out["total_kwh"] = pair_sum
-
-    # ---- TOU fallback ONLY if still unset and we see â‰¥2 TOU categories
-    if out.get("tariff_type") is None:
-        rate_any = rf'(?P<val>\d{{1,4}}(?:\.\d+)?)\s*(?P<unit>[cÂ¢]|\$)\s*(?:/|\bper\b)\s*{KWH_WORD}'
-        tou_specs = [
-            ("usage_cents_per_kwh_peak", re.compile(r'peak[^.\n]*?' + rate_any, re.IGNORECASE)),
-            ("usage_cents_per_kwh_shoulder", re.compile(r'shoulder[^.\n]*?' + rate_any, re.IGNORECASE)),
-            ("usage_cents_per_kwh_offpeak", re.compile(r'(off-?peak|off\s*peak)[^.\n]*?' + rate_any, re.IGNORECASE)),
-        ]
-        tou_hits = 0
-        for key, pat in tou_specs:
-            m = pat.search(txt)
-            if m:
-                out[key] = round(_to_cents(float(m.group("val")), m.group("unit")), 4)
-                tou_hits += 1
-        if tou_hits >= 2:
-            out["tariff_type"] = "TOU"
-
-    # ---- Total cost (incl GST), stricter: must have cents and appear on key lines
-    money_pat = re.compile(r'(\$?\s*\d{1,6}(?:,\d{3})*\.\d{2})')
-    preferred = ("current charges", "total for this bill", "electricity charges", "charges this bill",
-                 "amount due", "new charges", "total balance")
-    amts = []
     for i, ln in enumerate(lower):
-        if any(k in ln for k in preferred):
-            for m in money_pat.finditer(lines[i]):
-                val = _clean_num(m.group(1))
-                if val > 0: amts.append((i, val))
-    if amts:
-        out["total_cost_inc_gst"] = round(max(amts, key=lambda x: x[1])[1], 2)
-    else:
-        all_amts = [_clean_num(m.group(1)) for m in money_pat.finditer(txt)]
-        if all_amts:
-            out["total_cost_inc_gst"] = round(max(all_amts), 2)
+        if kwh_pref.search(ln):
+            m = kwh_num.search(lines[i])
+            if m:
+                total_kwh = _clean_num(m.group(1))
+                break
+            if i + 1 < len(lines):
+                m = kwh_num.search(lines[i + 1])
+                if m:
+                    total_kwh = _clean_num(m.group(1))
+                    break
 
-    # ---- daily_kwh if possible
-    if "total_kwh" in out and "period_start" in out and "period_end" in out:
+    # If not found, sum steps if available
+    if total_kwh is None and ("step1_kwh" in result or "step2_kwh" in result):
+        total_kwh = 0.0
+        if "step1_kwh" in result:
+            total_kwh += float(result["step1_kwh"])
+        if "step2_kwh" in result:
+            total_kwh += float(result["step2_kwh"])
+
+    # Last resort: highest explicit kWh anywhere (guarded by 'kwh' token)
+    if total_kwh is None:
+        m_all = [m for m in kwh_num.finditer(txt)]
+        if m_all:
+            total_kwh = max(_clean_num(m.group(1)) for m in m_all)
+
+    if total_kwh is not None:
+        result["total_kwh"] = round(total_kwh, 3)
+
+    # -------- 8) Derive daily_kwh --------
+    if "total_kwh" in result and "period_start" in result and "period_end" in result:
         try:
-            ds = datetime.fromisoformat(out["period_start"])
-            de = datetime.fromisoformat(out["period_end"])
+            ds = datetime.fromisoformat(result["period_start"])
+            de = datetime.fromisoformat(result["period_end"])
             days = max((de - ds).days, 1)
-            out["daily_kwh"] = round(float(out["total_kwh"]) / days, 2)
+            result["daily_kwh"] = round(float(result["total_kwh"]) / days, 2)
         except Exception:
             pass
 
-    return out
+    # Conservative default
+    result.setdefault("tariff_type", "FLAT")
+    return result
 
 # ---------- Bytes -> structured bill profile ----------
 def parse_bill_bytes(content: bytes, content_type: str) -> dict:
