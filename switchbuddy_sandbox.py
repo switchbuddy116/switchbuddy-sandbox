@@ -78,9 +78,8 @@ if _HAS_GCV:
 app = Flask(__name__)
 
 # One global place to set parser/build version
-PARSER_VERSION = "2025-08-18b"
 
-PARSER_VERSION = "2025-08-18c"
+PARSER_VERSION = "SBY-2025-08-18-parse3"
 
 @app.route("/parser_version", methods=["GET"])
 def parser_version():
