@@ -77,6 +77,14 @@ if _HAS_GCV:
 # -----------------------------
 app = Flask(__name__)
 
+# Single source of truth for parser build
+PARSER_VERSION = "SBY-2025-08-18-parse5"
+
+@app.route("/parser_version", methods=["GET"])
+def parser_version():
+    return {"parser_version": PARSER_VERSION}, 200
+
+
 @app.route("/_routes", methods=["GET"], endpoint="_routes_dump")
 def _routes_dump():
     routes = []
