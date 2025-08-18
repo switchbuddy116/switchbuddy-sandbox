@@ -13,13 +13,6 @@ from flask import Flask, request, Response, redirect
 from twilio.twiml.messaging_response import MessagingResponse
 from upstash_redis import Redis
 
-PARSER_VERSION = "2025-08-18a"  # at top of file once
-
-@app.route("/version", methods=["GET"])
-def version():
-    return {"parser_version": PARSER_VERSION}, 200
-
-
 
 # ----- Optional OCR libs -----
 # These imports are optional; we check availability at runtime.
@@ -83,6 +76,13 @@ if _HAS_GCV:
 # Flask app
 # -----------------------------
 app = Flask(__name__)
+
+# One global place to set parser/build version
+PARSER_VERSION = "2025-08-18b"
+
+@app.route("/version", methods=["GET"])
+def version():
+    return {"parser_version": PARSER_VERSION}, 200
 
 # -----------------------------
 # Helpers
