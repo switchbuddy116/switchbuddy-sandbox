@@ -324,30 +324,56 @@ def parse_bill_text(txt: str) -> dict:
             result["supply_cents_per_day"] = round(cents, 4)
             break
 
-    # --- 3) Money total (prefer context, avoid account numbers/refs) ---
-    money_token = re.compile(r'\$?\s*\d{1,6}(?:,\d{3})*(?:\.\d{2})?')
-    prefer_keys = ("new charges", "total for this bill", "electricity charges", "charges this bill", "amount due", "total balance")
+    # --- 3) Money total (prefer context, avoid refs & account numbers) ---
+    # Strategy:
+    #  a) look on the same line as keywords for $amounts
+    #  b) if not found, look within +/- 1 line window for $amounts
+    #  c) if still not found, look for decimal amounts near keywords (no $), but cap to sane values
+    prefer_keys = (
+        "new charges",
+        "total for this bill",
+        "electricity charges",
+        "charges this bill",
+        "amount due",
+        "total balance",
+    )
     bad_ctx = ("account number", "ref:", "customer number", "nmi", "biller code", "crn")
 
-    amounts = []
-    for ln in lines:
-        if any(k in ln for k in prefer_keys) and not any(b in ln for b in bad_ctx):
-            for m in money_token.finditer(ln):
-                amt = _clean_num(m.group(0))
-                if amt > 0:
-                    amounts.append(amt)
-    if amounts:
-        result["total_cost_inc_gst"] = round(max(amounts), 2)
-    else:
-        best = 0.0
-        for ln in pretty_lines:
-            low = ln.lower()
-            if any(k in low for k in ("new charges", "amount due", "total balance")) and not any(b in low for b in bad_ctx):
-                ms = re.findall(r'\$\s*\d{1,6}(?:,\d{3})*(?:\.\d{2})?', ln)
-                if ms:
-                    best = max(best, max(_clean_num(x) for x in ms))
-        if best > 0:
-            result["total_cost_inc_gst"] = round(best, 2)
+    # Require a $ for primary matches; allow 1–5 digits before optional thousands (we cap later anyway)
+    dollar_amt = re.compile(r'\$\s*\d{1,5}(?:,\d{3})*(?:\.\d{2})?')
+    # Secondary: decimal-only amounts like 131.08 (no $) near the keyword lines
+    decimal_amt = re.compile(r'(?<!\d)(\d{1,5}(?:,\d{3})*\.\d{2})(?!\d)')
+
+    candidates = []
+    key_line_indexes = []
+
+    for i, ln in enumerate(pretty_lines):
+        low = ln.lower()
+        if any(k in low for k in prefer_keys) and not any(b in low for b in bad_ctx):
+            key_line_indexes.append(i)
+            # same line with $
+            for m in dollar_amt.finditer(ln):
+                candidates.append((i, _clean_num(m.group(0))))
+            # window +/- 1 line for $
+            for j in (i - 1, i + 1):
+                if 0 <= j < len(pretty_lines):
+                    for m in dollar_amt.finditer(pretty_lines[j]):
+                        candidates.append((j, _clean_num(m.group(0))))
+            # window +/- 1 line for decimal-only amounts
+            for j in (i, i - 1, i + 1):
+                if 0 <= j < len(pretty_lines):
+                    for m in decimal_amt.finditer(pretty_lines[j]):
+                        candidates.append((j, _clean_num(m.group(1))))
+
+    if candidates:
+        # Drop insane values and anything 0/negative
+        filtered = [(idx, amt) for idx, amt in candidates if 0 < amt < 10000]
+        if filtered:
+            # Choose the one closest to the most recent keyword line; break ties by larger value
+            last_key_idx = max(key_line_indexes) if key_line_indexes else 0
+            filtered.sort(key=lambda x: (abs(x[0] - last_key_idx), -x[1]))
+            result["total_cost_inc_gst"] = round(filtered[0][1], 2)
+
 
     # --- 4) Rates & kWh: FLAT vs TIERED ---
     # Accept: "27.731 c/kwh", "$0.277/kwh", "27.731 cents/kwh"
