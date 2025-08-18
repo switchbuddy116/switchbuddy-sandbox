@@ -13,6 +13,9 @@ from flask import Flask, request, Response, redirect
 from twilio.twiml.messaging_response import MessagingResponse
 from upstash_redis import Redis
 
+PARSER_VERSION = "2025-08-18a"
+
+
 # ----- Optional OCR libs -----
 # These imports are optional; we check availability at runtime.
 try:
@@ -558,8 +561,9 @@ def get_session():
 VERSION = "SBY-2025-08-17-parse2"
 
 @app.route("/version", methods=["GET"])
-def svc_version():
-    return {"version": VERSION}, 200
+def version():
+    return {"parser_version": PARSER_VERSION}, 200
+
 
 
 
@@ -717,18 +721,22 @@ def whatsapp_webhook():
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
 
-        entry = {
-            "media_url": media_url,                 # Twilio temp URL (expires)
-            "media_type": media_type or fetched_type or "",
-            "ts": int(time.time()),
-            "downloaded_ok": downloaded_ok,
-            "download_err": err,
-            "download_size_bytes": size_bytes,
-        }
-        if parsed:
-            entry["parsed"] = parsed
-        if ocr_excerpt:
-            entry["ocr_excerpt"] = ocr_excerpt
+entry = {
+    "media_url": media_url,
+    "media_type": media_type or fetched_type or "",
+    "ts": int(time.time()),
+    "downloaded_ok": downloaded_ok,
+    "download_err": err,
+    "download_size_bytes": size_bytes,
+}
+# add this line (anywhere after entry is defined is fine)
+entry["parser_version"] = PARSER_VERSION
+
+if parsed:
+    entry["parsed"] = parsed
+if ocr_excerpt:
+    entry["ocr_excerpt"] = ocr_excerpt
+
 
         r.rpush(k_bills, json.dumps(entry))
         new_count = bill_count + 1
@@ -809,6 +817,58 @@ def last_bill():
         return {"phone": phone, "last_bill": json.loads(last)}, 200
     except Exception:
         return {"phone": phone, "last_bill": {"raw": str(last)}}, 200
+
+@app.route("/reparse_last_from_ocr", methods=["POST", "GET"])
+def reparse_last_from_ocr():
+    phone = e164(request.args.get("phone", "") or request.values.get("phone", ""))
+    if not phone:
+        return {"error": "Missing ?phone=E164 (encode + as %2B)"}, 400
+
+    k_bills = f"user:{phone}:bills"
+    entries = r.lrange(k_bills, 0, -1) or []
+    if not entries:
+        return {"error": "No bills saved for this phone"}, 404
+
+    idx = len(entries) - 1
+    last = entries[idx]
+    if isinstance(last, bytes):
+        last = last.decode("utf-8", errors="ignore")
+    try:
+        j = json.loads(last)
+    except Exception:
+        return {"error": "Last bill is not valid JSON"}, 500
+
+    ocr = j.get("ocr_excerpt") or ""
+    if not ocr:
+        return {"error": "Last bill has no ocr_excerpt stored; upload again once to populate it"}, 409
+
+    # Re-run the CURRENT parser on the stored OCR text
+    new_parsed = parse_bill_text(ocr)
+    j["parsed"] = new_parsed
+    j["parser_version"] = PARSER_VERSION
+
+    # Write back into the list at the same index
+    r.lset(k_bills, idx, json.dumps(j))
+
+    # Refresh comparison snapshot based on latest parsed bill
+    try:
+        compare_and_store(phone)
+    except Exception:
+        pass
+
+    return {"reparsed": new_parsed, "parser_version": PARSER_VERSION}, 200
+
+@app.route("/purge_bills", methods=["POST", "GET"])
+def purge_bills():
+    phone = e164(request.args.get("phone", "") or request.values.get("phone", ""))
+    if not phone:
+        return {"error": "Missing ?phone=E164 (encode + as %2B)"}, 400
+    k_bills = f"user:{phone}:bills"
+    r.delete(k_bills)
+    r.delete(f"user:{phone}:bill_count")
+    r.delete(f"user:{phone}:last_comparison")
+    return {"ok": True}, 200
+
 
 # -----------------------------
 # Entrypoint (local dev)
