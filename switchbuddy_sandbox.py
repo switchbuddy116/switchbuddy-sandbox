@@ -243,6 +243,19 @@ def parse_bill_text(txt: str) -> dict:
             return value * 100.0
         return value  # treat c/¢/cent/cents as cents
 
+    # Sanity clamps
+    if "supply_cents_per_day" in result and not (10 <= result["supply_cents_per_day"] <= 300):
+        result.pop("supply_cents_per_day", None)
+
+    if "usage_cents_per_kwh_step1" in result and not (5 <= result["usage_cents_per_kwh_step1"] <= 100):
+        result.pop("usage_cents_per_kwh_step1", None)
+    if "usage_cents_per_kwh_step2" in result and not (5 <= result["usage_cents_per_kwh_step2"] <= 100):
+        result.pop("usage_cents_per_kwh_step2", None)
+
+    if "total_cost_inc_gst" in result and not (0 < result["total_cost_inc_gst"] < 10000):
+        result.pop("total_cost_inc_gst", None)
+
+
     # --- 0) Normalise OCR weirdness ---
     pretty = txt
     text = txt.lower()
@@ -458,6 +471,28 @@ def parse_bill_text(txt: str) -> dict:
                     if "usage_cents_per_kwh_step2" in step2 and abs(cents - step2["usage_cents_per_kwh_step2"]) < 1e-6:
                         step2.setdefault("step2_kwh", kw)
 
+    # ---- Tiered kWh per step (if printed) ----
+    tier_blocks = _extract_tier_blocks(pretty_lines)
+    if tier_blocks:
+        # Match kWhs to whichever step rate they align to (within 0.2c tolerance)
+        tol = 0.2
+        s1 = result.get("usage_cents_per_kwh_step1")
+        s2 = result.get("usage_cents_per_kwh_step2")
+        step1_kwh = step2_kwh = 0.0
+        for kwh, cents in tier_blocks:
+            if s1 is not None and abs(cents - s1) <= tol:
+                step1_kwh += kwh
+            elif s2 is not None and abs(cents - s2) <= tol:
+                step2_kwh += kwh
+        if step1_kwh:
+            result["step1_kwh"] = round(step1_kwh, 3)
+        if step2_kwh:
+            result["step2_kwh"] = round(step2_kwh, 3)
+        # If total_kwh missing or obviously too small, rebuild it
+        if (not result.get("total_kwh")) or result.get("total_kwh", 0) < (step1_kwh + step2_kwh)*0.9:
+            result["total_kwh"] = round(step1_kwh + step2_kwh, 3)
+
+
     # --- 5) Total kWh ---
     total_kwh = 0.0
     for ln in lines:
@@ -637,6 +672,31 @@ def estimate_annual_cost(profile: dict, plan: dict) -> float:
 
     annual_kwh = daily_kwh * 365
     supply_cents = float(plan.get("supply_cents_per_day") or 0) * 365
+
+    if plan.get("tariff_type") == "TIERED" or (
+        profile.get("tariff_type") == "TIERED"
+        and profile.get("usage_cents_per_kwh_step1") is not None
+        and profile.get("usage_cents_per_kwh_step2") is not None
+    ):
+        # Use bill-observed split if available
+        s1_rate = float(profile.get("usage_cents_per_kwh_step1") or 0)
+        s2_rate = float(profile.get("usage_cents_per_kwh_step2") or 0)
+
+        s1_kwh_bill = float(profile.get("step1_kwh") or 0)
+        s2_kwh_bill = float(profile.get("step2_kwh") or 0)
+        total_bill_kwh = s1_kwh_bill + s2_kwh_bill
+
+        if total_bill_kwh > 0:
+            s1_share = s1_kwh_bill / total_bill_kwh
+            s2_share = s2_kwh_bill / total_bill_kwh
+        else:
+            # fallback if we didn't parse kWh per step
+            s1_share, s2_share = 0.6, 0.4
+
+        s1_kwh_annual = annual_kwh * s1_share
+        s2_kwh_annual = annual_kwh * s2_share
+        usage_cents = s1_kwh_annual * s1_rate + s2_kwh_annual * s2_rate
+
 
     if plan.get("tariff_type") == "FLAT":
         usage_cents = annual_kwh * float(plan.get("usage_cents_per_kwh") or 0)
