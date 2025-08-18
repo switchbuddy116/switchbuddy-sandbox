@@ -364,36 +364,143 @@ def parse_bill_text(txt: str) -> dict:
         if "rate_cents" in step2: result["usage_cents_per_kwh_step2"] = step2["rate_cents"]
         if "kwh" in step2:        result["step2_kwh"] = round(step2["kwh"], 3)
 
-    # -------- 4) TOU (require >=2 TOU rates) --------
-    if "tariff_type" not in result:
-        rate_any = rf"(?P<val>\d{{1,4}}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$)\s*{PER_TOKEN}{KWH_TOKEN}\b"
+        # ---------- 4) Usage rates (TIERED first, then TOU, then FLAT) ----------
+    rate_any = r'(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$)\s*\/?\s*kwh'
+    did_tiered = False
+    tier_debug = []
+
+    # Join lines to allow cross-line matches while still being robust
+    joined = " ".join(lines)
+
+    # --- TIERED (two-step) patterns ---
+    # Form A: "first <kwh1> kWh @ <rate1> c/kWh" ... "remaining/balance/after <kwh2> kWh @ <rate2> c/kWh"
+    pat_first_a = re.compile(
+        r'(?:first|up to)\s*(?P<kwh1>\d{1,6}(?:\.\d+)?)\s*kwh[^@]*?@?\s*(?P<rate1>\d{1,4}(?:\.\d+)?)\s*([c¢]|\$)\s*/?\s*kwh',
+        re.IGNORECASE
+    )
+    pat_rem_a = re.compile(
+        r'(?:balance|remaining|after|thereafter)\s*(?P<kwh2>\d{1,6}(?:\.\d+)?)\s*kwh[^@]*?@?\s*(?P<rate2>\d{1,4}(?:\.\d+)?)\s*([c¢]|\$)\s*/?\s*kwh',
+        re.IGNORECASE
+    )
+
+    # Form B: "<rate1> c/kWh ... first <kwh1> kWh" ... "<rate2> c/kWh ... remaining/after <kwh2> kWh"
+    pat_first_b = re.compile(
+        r'(?P<rate1>\d{1,4}(?:\.\d+)?)\s*([c¢]|\$)\s*/?\s*kwh[^\.]*?(?:first|up to)\s*(?P<kwh1>\d{1,6}(?:\.\d+)?)\s*kwh',
+        re.IGNORECASE
+    )
+    pat_rem_b = re.compile(
+        r'(?P<rate2>\d{1,4}(?:\.\d+)?)\s*([c¢]|\$)\s*/?\s*kwh[^\.]*?(?:balance|remaining|after|thereafter)\s*(?P<kwh2>\d{1,6}(?:\.\d+)?)\s*kwh',
+        re.IGNORECASE
+    )
+
+    m1 = pat_first_a.search(joined) or pat_first_b.search(joined)
+    m2 = pat_rem_a.search(joined)  or pat_rem_b.search(joined)
+
+    if m1 and m2:
+        # Pull first tier
+        kwh1 = _clean_num(m1.group('kwh1'))
+        rate1_raw = float(m1.group('rate1'))
+        # unit comes from the pattern group (we used ([c¢]|\$)) so detect $ vs c
+        unit1 = '$' if '$' in m1.group(0) else 'c'
+        cents1 = _to_cents(rate1_raw, unit1)
+        # Pull second tier
+        kwh2 = _clean_num(m2.group('kwh2'))
+        rate2_raw = float(m2.group('rate2'))
+        unit2 = '$' if '$' in m2.group(0) else 'c'
+        cents2 = _to_cents(rate2_raw, unit2)
+
+        # Only accept if tiers look sane
+        if kwh1 > 0 and kwh2 > 0 and cents1 > 0 and cents2 > 0:
+            result["tariff_type"] = "TIERED"
+            result["step1_kwh"] = round(kwh1, 3)
+            result["step2_kwh"] = round(kwh2, 3)
+            result["usage_cents_per_kwh_step1"] = round(cents1, 3)
+            result["usage_cents_per_kwh_step2"] = round(cents2, 3)
+
+            if "total_kwh" not in result or not result.get("total_kwh"):
+                result["total_kwh"] = round(kwh1 + kwh2, 3)
+
+            did_tiered = True
+            tier_debug.append(f"TIERED_A/B OK: first={kwh1}kWh@{cents1}c, rest={kwh2}kWh@{cents2}c")
+
+    # If still not tiered, attempt a backup tier form that lists two explicit "X kWh @ Y c/kWh" lines without words
+    if not did_tiered:
+        # find all "X kWh @ Y c/kWh" pairs and see if there are 2 distinct ones
+        pat_pair = re.compile(
+            r'(?P<kwh>\d{1,6}(?:\.\d+)?)\s*kwh[^@]*?@?\s*(?P<rate>\d{1,4}(?:\.\d+)?)\s*([c¢]|\$)\s*/?\s*kwh',
+            re.IGNORECASE
+        )
+        pairs = []
+        for m in pat_pair.finditer(joined):
+            kwh = _clean_num(m.group('kwh'))
+            rate_raw = float(m.group('rate'))
+            unit = '$' if '$' in m.group(0) else 'c'
+            cents = _to_cents(rate_raw, unit)
+            if kwh > 0 and cents > 0:
+                pairs.append((kwh, cents, m.group(0)[:80]))
+
+        # Deduplicate by (kwh, rate) and pick the two biggest kWh entries
+        if pairs:
+            uniq = {}
+            for kwh, cents, frag in pairs:
+                uniq[(round(kwh, 3), round(cents, 3))] = frag
+            pairs2 = sorted([(k, c, uniq[(round(k,3),round(c,3))]) for (k, c) in uniq.keys()], key=lambda t: t[0], reverse=True)
+            if len(pairs2) >= 2:
+                # assume larger chunk is step2 (remaining), smaller is step1 (first)
+                kwh2, cents2, frag2 = pairs2[0]
+                kwh1, cents1, frag1 = pairs2[1]
+                # Prevent the “same rate twice” collapse only if the bill actually shows different rates;
+                # if rates are same it’s effectively FLAT broken into two lines.
+                if cents1 != cents2:
+                    result["tariff_type"] = "TIERED"
+                    result["step1_kwh"] = round(kwh1, 3)
+                    result["step2_kwh"] = round(kwh2, 3)
+                    result["usage_cents_per_kwh_step1"] = round(cents1, 3)
+                    result["usage_cents_per_kwh_step2"] = round(cents2, 3)
+                    if "total_kwh" not in result or not result.get("total_kwh"):
+                        result["total_kwh"] = round(kwh1 + kwh2, 3)
+                    did_tiered = True
+                    tier_debug.append(f"TIERED_Fallback pairs: step1={kwh1}@{cents1}c, step2={kwh2}@{cents2}c")
+
+    # --- If we didn’t detect TIERED, try TOU (peak/shoulder/off-peak) ---
+    if not did_tiered:
         tou_specs = [
-            ("usage_cents_per_kwh_peak", re.compile(r"\bpeak\b[^.\n]*?" + rate_any, re.IGNORECASE)),
-            ("usage_cents_per_kwh_shoulder", re.compile(r"\bshoulder\b[^.\n]*?" + rate_any, re.IGNORECASE)),
-            ("usage_cents_per_kwh_offpeak", re.compile(r"(?:off-?peak|off\s*peak)[^.\n]*?" + rate_any, re.IGNORECASE)),
+            ("usage_cents_per_kwh_peak", re.compile(r'peak[^.\n]*?' + rate_any, re.IGNORECASE)),
+            ("usage_cents_per_kwh_shoulder", re.compile(r'shoulder[^.\n]*?' + rate_any, re.IGNORECASE)),
+            ("usage_cents_per_kwh_offpeak", re.compile(r'(off-?peak|off peak)[^.\n]*?' + rate_any, re.IGNORECASE)),
         ]
-        found = 0
+        found_tou = False
         for key, pat in tou_specs:
             for ln in lines:
                 m = pat.search(ln)
                 if m:
                     val = _to_cents(float(m.group("val")), m.group("unit"))
                     result[key] = round(val, 4)
-                    found += 1
+                    found_tou = True
                     break
-        if found >= 2:
+        if found_tou:
             result["tariff_type"] = "TOU"
 
-    # -------- 5) FLAT fallback --------
+    # --- If still nothing, FLAT / single / anytime ---
     if "tariff_type" not in result:
-        flat_pat = re.compile(rf"(anytime|single\s*rate|general|flat|usage|energy)[^.\n]*?(\d{{1,4}}(?:\.\d+)?)\s*([c¢]|\$)\s*{PER_TOKEN}{KWH_TOKEN}\b", re.IGNORECASE)
-        for ln in lines:
-            m = flat_pat.search(ln)
-            if m:
-                val = _to_cents(float(m.group(2)), m.group(3))
-                result["tariff_type"] = "FLAT"
-                result["usage_cents_per_kwh"] = round(val, 4)
+        flat_pats = [
+            re.compile(r'(anytime|single\s*rate|general|usage|energy)[^.\n]*?' + rate_any, re.IGNORECASE),
+            re.compile(r'(?<!peak)(?<!off)[^.\n]*?' + rate_any, re.IGNORECASE),  # last resort
+        ]
+        for pat in flat_pats:
+            for ln in lines:
+                m = pat.search(ln)
+                if m:
+                    val = _to_cents(float(m.group("val")), m.group("unit"))
+                    result["tariff_type"] = "FLAT"
+                    result["usage_cents_per_kwh"] = round(val, 4)
+                    break
+            if "usage_cents_per_kwh" in result:
                 break
+
+    if tier_debug:
+        result["_tier_debug"] = " | ".join(tier_debug)[:500]
+
 
     # -------- 6) Supply (c/day or $/day with weird spacing) --------
     supply_pat = re.compile(
