@@ -1050,6 +1050,28 @@ def whatsapp_webhook():
         msg.body("Say 'hi' to get started with your bill upload.")
     return str(resp)
 
+    summary_bits = []
+    if parsed.get("tariff_type"):
+        summary_bits.append(f"Tariff: {parsed['tariff_type']}")
+    if parsed.get("usage_cents_per_kwh_step1") is not None:
+        summary_bits.append(f"S1: {parsed['usage_cents_per_kwh_step1']}c/kWh")
+    if parsed.get("usage_cents_per_kwh_step2") is not None:
+        summary_bits.append(f"S2: {parsed['usage_cents_per_kwh_step2']}c/kWh")
+    if parsed.get("step1_kwh") is not None:
+        summary_bits.append(f"S1 kWh: {parsed['step1_kwh']}")
+    if parsed.get("step2_kwh") is not None:
+        summary_bits.append(f"S2 kWh: {parsed['step2_kwh']}")
+    if parsed.get("supply_cents_per_day") is not None:
+        summary_bits.append(f"Supply: {parsed['supply_cents_per_day']}c/day")
+    if parsed.get("total_kwh") is not None:
+        summary_bits.append(f"Total kWh: {parsed['total_kwh']}")
+    if parsed.get("total_cost_inc_gst") is not None:
+        summary_bits.append(f"Bill: ${parsed['total_cost_inc_gst']:.2f}")
+
+    if summary_bits:
+        msg.body("Parsed:\n• " + "\n• ".join(summary_bits))
+
+
 # -----------------------------
 # Admin/testing
 # -----------------------------
