@@ -721,22 +721,23 @@ def whatsapp_webhook():
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
 
-entry = {
-    "media_url": media_url,
-    "media_type": media_type or fetched_type or "",
-    "ts": int(time.time()),
-    "downloaded_ok": downloaded_ok,
-    "download_err": err,
-    "download_size_bytes": size_bytes,
-}
-# add this line (anywhere after entry is defined is fine)
-entry["parser_version"] = PARSER_VERSION
-
-if parsed:
-    entry["parsed"] = parsed
-if ocr_excerpt:
-    entry["ocr_excerpt"] = ocr_excerpt
-
+        entry = {
+            "media_url": media_url,                 # Twilio temp URL (expires)
+            "media_type": media_type or fetched_type or "",
+            "ts": int(time.time()),
+            "downloaded_ok": downloaded_ok,
+            "download_err": err,
+            "download_size_bytes": size_bytes,
+        }
+        if parsed:
+            entry["parsed"] = parsed
+        if ocr_excerpt:
+            entry["ocr_excerpt"] = ocr_excerpt
+        # Tag with current parser version if defined
+        try:
+            entry["parser_version"] = PARSER_VERSION
+        except NameError:
+            pass
 
         r.rpush(k_bills, json.dumps(entry))
         new_count = bill_count + 1
@@ -753,13 +754,13 @@ if ocr_excerpt:
                 human_size = f"{size_bytes/1024/1024:.2f} MB"
 
             msg.body(
-                f"Bill received \u2705 (#{new_count}).\n"
+                f"Bill received ✅ (#{new_count}).\n"
                 f"(Fetched media: {human_size})\n\n"
                 "Reply 'add another bill' to add more, 'list bills' to review, or 'that's all' to finish."
             )
         else:
             msg.body(
-                f"Bill received \u2705 (#{new_count}).\n"
+                f"Bill received ✅ (#{new_count}).\n"
                 "Heads up: I couldn't fetch the file from Twilio just now, but the link was saved. "
                 "You can try sending it again, or proceed.\n\n"
                 "Reply 'add another bill' to add more, 'list bills' to review, or 'that's all' to finish."
