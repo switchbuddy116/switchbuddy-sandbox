@@ -701,8 +701,9 @@ VERSION = "SBY-2025-08-17-parse2"
 import inspect
 from hashlib import sha1
 
-@app.route("/version", methods=["GET"])
-def version():
+@app.route("/version_debug", methods=["GET"], endpoint="version_debug")
+def version_debug():
+
     # Quick proof of which build is live
     src = inspect.getsource(parse_bill_text)
     sig = sha1(src.encode("utf-8")).hexdigest()[:12]
