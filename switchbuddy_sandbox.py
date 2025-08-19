@@ -307,16 +307,18 @@ def parse_bill_text(txt: str) -> dict:
             if ds and de and de >= ds:
                 result["period_start"] = ds.date().isoformat()
                 result["period_end"] = de.date().isoformat()
-supply_pat = re.compile(
-    r'(supply|daily)\s+(charge|service|fixed)[^0-9]*(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>\$|c|¢|cent|cents)\s*(?:/| per )\s*(day|d)\b',
-    re.IGNORECASE
-)
+    # Supply charge (c/day or $/day)
+    supply_pat = re.compile(
+        r'(supply|daily)\s+(charge|service|fixed)[^0-9]*(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>\$|c|¢|cent|cents)\s*(?:/| per )\s*(day|d)\b',
+        re.IGNORECASE
+    )
     for ln in lines:
         m = supply_pat.search(ln)
         if m:
             cents = _to_cents(_clean_num(m.group("val")), m.group("unit"))
             result["supply_cents_per_day"] = round(cents, 4)
             break
+
     prefer_keys = ("new charges","total for this bill","electricity charges","charges this bill","amount due","total balance")
     bad_ctx = ("account number","ref:","customer number","nmi","biller code","crn")
     dollar_amt = re.compile(r'\$\s*\d{1,5}(?:,\d{3})*(?:\.\d{2})?')
