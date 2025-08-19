@@ -160,27 +160,24 @@ def download_twilio_media(media_url: str, timeout=15):
     return content, content_type, (content_length if content_length is not None else len(content))
 
 # ---------- OCR & parsing pipeline ----------
-# ---------- Helper: extract (kWh, cents/kWh) tier rows from pretty OCR lines ----------
+
+# ---------- Helper: extract (kWh, value, unit) tier rows from pretty OCR lines ----------
 def _extract_tier_blocks(pretty_lines):
     """
-    Return list of (kwh, cents_per_kwh) found in lines like:
-      "215.119 kWh @ 27.731 c/kWh" or "Step 1 300 kWh @ 20.1 c/kWh".
+    Return list of (kwh_str, value_str, unit_str) found in lines like:
+      "215.119 kWh @ 27.731 c/kWh"  OR  "300 kWh @ $0.277/kWh"
+    Unit may be c/¢/cent(s) or $.
     """
     import re
     out = []
     pat = re.compile(
         r'(?P<kwh>\d{1,6}(?:\.\d+)?)\s*kwh[^@\n]*@\s*'
-        r'(?P<val>\d{1,4}(?:\.\d+)?)\s*(?:c|¢|cent|cents)\s*/\s*kwh',
+        r'(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>\$|c|¢|cent|cents)\s*(?:/| per )\s*kwh',
         re.IGNORECASE
     )
     for ln in pretty_lines:
         for m in pat.finditer(ln):
-            try:
-                kwh = float(m.group("kwh").replace(",", ""))
-                cents = float(m.group("val").replace(",", ""))
-                out.append((kwh, cents))
-            except Exception:
-                pass
+            out.append((m.group("kwh"), m.group("val"), m.group("unit")))
     return out
 
 def ocr_extract_text(content: bytes, content_type: str) -> str:
@@ -310,7 +307,10 @@ def parse_bill_text(txt: str) -> dict:
             if ds and de and de >= ds:
                 result["period_start"] = ds.date().isoformat()
                 result["period_end"] = de.date().isoformat()
-    supply_pat = re.compile(r'(supply|daily)\s+(charge|service|fixed)[^0-9]*(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$|cent|cents)\s*\/\s*(day|d)\b', re.IGNORECASE)
+supply_pat = re.compile(
+    r'(supply|daily)\s+(charge|service|fixed)[^0-9]*(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>\$|c|¢|cent|cents)\s*(?:/| per )\s*(day|d)\b',
+    re.IGNORECASE
+)
     for ln in lines:
         m = supply_pat.search(ln)
         if m:
@@ -407,21 +407,33 @@ def parse_bill_text(txt: str) -> dict:
                         step2.setdefault("step2_kwh", kw)
     tier_blocks = _extract_tier_blocks(pretty_lines)
     if tier_blocks:
+        # Convert tier values to cents using the same logic the parser uses elsewhere
         tol = 0.2
         s1 = step1.get("usage_cents_per_kwh_step1")
         s2 = step2.get("usage_cents_per_kwh_step2")
         step1_kwh = step2_kwh = 0.0
-        for kwh, cents in tier_blocks:
-            if s1 is not None and abs(cents - s1) <= tol:
+
+        for kwh_raw, val_raw, unit_raw in tier_blocks:
+            try:
+                kwh = float(kwh_raw.replace(",", ""))
+                cents_val = _to_cents(_clean_num(val_raw), unit_raw)
+            except Exception:
+                continue
+
+            if s1 is not None and abs(cents_val - s1) <= tol:
                 step1_kwh += kwh
-            elif s2 is not None and abs(cents - s2) <= tol:
+            elif s2 is not None and abs(cents_val - s2) <= tol:
                 step2_kwh += kwh
+
         if step1_kwh:
             result["step1_kwh"] = round(step1_kwh, 3)
         if step2_kwh:
             result["step2_kwh"] = round(step2_kwh, 3)
-        if (not result.get("total_kwh")) or result.get("total_kwh", 0) < (step1_kwh + step2_kwh)*0.9:
+
+        # If total_kwh missing or obviously too small, rebuild it
+        if (not result.get("total_kwh")) or float(result.get("total_kwh", 0)) < (step1_kwh + step2_kwh) * 0.9:
             result["total_kwh"] = round(step1_kwh + step2_kwh, 3)
+
     total_kwh = 0.0
     for ln in lines:
         if any(k in ln for k in ("total usage","usage this bill","total kwh","energy used")):
