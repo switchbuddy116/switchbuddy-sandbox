@@ -161,11 +161,11 @@ def download_twilio_media(media_url: str, timeout=15):
 
 # ---------- OCR & parsing pipeline ----------
 
-# ---------- Helper: extract (kWh, value, unit) tier rows from pretty OCR lines ----------
-def _extract_tier_blocks(pretty_lines):
+# ---------- Helper: extract (kWh, value, unit) tier rows from normalized lines ----------
+def _extract_tier_blocks(norm_lines):
     """
-    Return list of (kwh_str, value_str, unit_str) found in lines like:
-      "215.119 kWh @ 27.731 c/kWh"  OR  "300 kWh @ $0.277/kWh"
+    Return list of (kwh_str, value_str, unit_str) from rows like:
+      "215.119 kWh @ 27.731 c/kwh"  OR  "300 kWh @ $0.277 / kwh"
     Unit may be c/¢/cent(s) or $.
     """
     import re
@@ -175,10 +175,11 @@ def _extract_tier_blocks(pretty_lines):
         r'(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>\$|c|¢|cent|cents)\s*(?:/| per )\s*kwh',
         re.IGNORECASE
     )
-    for ln in pretty_lines:
+    for ln in norm_lines:
         for m in pat.finditer(ln):
             out.append((m.group("kwh"), m.group("val"), m.group("unit")))
     return out
+
 
 def ocr_extract_text(content: bytes, content_type: str) -> str:
     """
@@ -319,6 +320,7 @@ def parse_bill_text(txt: str) -> dict:
             result["supply_cents_per_day"] = round(cents, 4)
             break
 
+
     prefer_keys = ("new charges","total for this bill","electricity charges","charges this bill","amount due","total balance")
     bad_ctx = ("account number","ref:","customer number","nmi","biller code","crn")
     dollar_amt = re.compile(r'\$\s*\d{1,5}(?:,\d{3})*(?:\.\d{2})?')
@@ -407,7 +409,7 @@ def parse_bill_text(txt: str) -> dict:
                         step1.setdefault("step1_kwh", kw)
                     if "usage_cents_per_kwh_step2" in step2 and abs(cents - step2["usage_cents_per_kwh_step2"]) < 1e-6:
                         step2.setdefault("step2_kwh", kw)
-    tier_blocks = _extract_tier_blocks(pretty_lines)
+    tier_blocks = _extract_tier_blocks(lines)
     if tier_blocks:
         # Convert tier values to cents using the same logic the parser uses elsewhere
         tol = 0.2
@@ -450,6 +452,22 @@ def parse_bill_text(txt: str) -> dict:
             total_kwh = s1 + s2
     if total_kwh:
         result["total_kwh"] = round(total_kwh, 3)
+    # Fallback: if total_kwh still missing, use the largest standalone kWh we see
+    if "total_kwh" not in result:
+        kwh_vals = []
+        for ln in lines:
+            for mk in kwh_pat.finditer(ln):
+                try:
+                    kwh_vals.append(float(mk.group("kwh").replace(",", "")))
+                except Exception:
+                    pass
+        if kwh_vals:
+            guess = max(kwh_vals)
+            # Avoid picking a small tier row if tiers look big
+            min_reasonable = (result.get("step1_kwh", 0) or 0) + (result.get("step2_kwh", 0) or 0)
+            if guess >= max(min_reasonable, 50):  # 50 kWh guard
+                result["total_kwh"] = round(guess, 3)
+
     if step1 and step2:
         result["tariff_type"] = "TIERED"; result.update(step1); result.update(step2)
     elif flat_val is not None and "tariff_type" not in result:
