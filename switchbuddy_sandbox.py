@@ -77,9 +77,15 @@ if _HAS_GCV:
 # -----------------------------
 app = Flask(__name__)
 
-# Single source of truth for parser build
-PARSER_VERSION = "SBY-2025-08-18-parse5"
+# One global place to set parser/build version
 
+PARSER_VERSION = "SBY-2025-08-18-parse7"
+
+# version ping
+@app.route("/version", methods=["GET"], endpoint="version_ping")
+def version():
+
+    return {"parser_version": PARSER_VERSION}, 200
 @app.route("/parser_version", methods=["GET"])
 def parser_version():
     return {"parser_version": PARSER_VERSION}, 200
@@ -92,17 +98,6 @@ def _routes_dump():
         methods = sorted(m for m in r.methods if m not in {"HEAD", "OPTIONS"})
         routes.append({"rule": str(r.rule), "endpoint": r.endpoint, "methods": methods})
     return {"routes": routes}, 200
-
-
-# One global place to set parser/build version
-
-PARSER_VERSION = "SBY-2025-08-18-parse7"
-
-# version ping
-@app.route("/version", methods=["GET"], endpoint="version_ping")
-def version():
-
-    return {"parser_version": PARSER_VERSION}, 200
 
 
 # -----------------------------
@@ -227,7 +222,6 @@ def parse_bill_text(txt: str) -> dict:
     """
     import re
     from datetime import datetime
-
     def _clean_num(s: str) -> float:
         s = s.replace(",", "").replace("$", "").replace("€", "").replace("£", "")
         s = s.replace(" ", "")
@@ -235,64 +229,33 @@ def parse_bill_text(txt: str) -> dict:
             return float(s)
         except Exception:
             return 0.0
-
     def _to_cents(value: float, unit: str) -> float:
         unit = (unit or "").strip().lower()
-        # support $, c, ¢, cent, cents
         if unit in ("$", "aud", "usd", "nz$", "£", "€"):
             return value * 100.0
-        return value  # treat c/¢/cent/cents as cents
-
-    # Sanity clamps
-    if "supply_cents_per_day" in result and not (10 <= result["supply_cents_per_day"] <= 300):
-        result.pop("supply_cents_per_day", None)
-
-    if "usage_cents_per_kwh_step1" in result and not (5 <= result["usage_cents_per_kwh_step1"] <= 100):
-        result.pop("usage_cents_per_kwh_step1", None)
-    if "usage_cents_per_kwh_step2" in result and not (5 <= result["usage_cents_per_kwh_step2"] <= 100):
-        result.pop("usage_cents_per_kwh_step2", None)
-
-    if "total_cost_inc_gst" in result and not (0 < result["total_cost_inc_gst"] < 10000):
-        result.pop("total_cost_inc_gst", None)
-
-
-    # --- 0) Normalise OCR weirdness ---
+        return value
     pretty = txt
     text = txt.lower()
-
-    # squash spaces; unify tokens
     text = re.sub(r"[ \t]+", " ", text)
-    # join split decimals like "27 .731" -> "27.731"
     text = re.sub(r"(\d)\s*\.\s*(\d+)", r"\1.\2", text)
-    # join "k wh" -> "kwh"
     text = text.replace("k wh", "kwh").replace("kw h", "kwh").replace("k w h", "kwh")
-    # unify per-kwh tokens
     text = text.replace("c / kwh", "c/kwh").replace("c /kwh", "c/kwh").replace("¢ / kwh", "c/kwh")
     text = text.replace("cents per kwh", "c/kwh").replace("cent per kwh", "c/kwh").replace("per kwh", "/kwh")
     text = text.replace("any time", "anytime").replace("off -peak", "off-peak").replace("off - peak", "off-peak")
-
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     pretty_lines = [ln.strip() for ln in pretty.splitlines() if ln.strip()]
-
     result: dict = {}
-
-    # --- 1) Billing period ---
     date_pat = re.compile(r'(?P<d>\d{1,2})[\/\-\s](?P<m>\d{1,2}|[A-Za-z]{3,9})[\/\-\s](?P<y>\d{2,4})', re.IGNORECASE)
-    month_map = {
-        'jan':1,'january':1,'feb':2,'february':2,'mar':3,'march':3,'apr':4,'april':4,
-        'may':5,'jun':6,'june':6,'jul':7,'july':7,'aug':8,'august':8,'sep':9,'sept':9,'september':9,
-        'oct':10,'october':10,'nov':11,'november':11,'dec':12,'december':12
-    }
+    month_map = {'jan':1,'january':1,'feb':2,'february':2,'mar':3,'march':3,'apr':4,'april':4,'may':5,'jun':6,'june':6,'jul':7,'july':7,'aug':8,'august':8,'sep':9,'sept':9,'september':9,'oct':10,'october':10,'nov':11,'november':11,'dec':12,'december':12}
     def _parse_date(m):
         d = int(m.group("d")); mm = m.group("m"); y = int(m.group("y"))
         if y < 100: y += 2000
         mo = int(mm) if mm.isdigit() else month_map.get(mm.lower(), 1)
         try: return datetime(y, mo, d)
         except Exception: return None
-
     period_found = False
     for ln in lines:
-        if any(k in ln for k in ("billing period", "for the period", "supply period", "usage period", "period from")):
+        if any(k in ln for k in ("billing period","for the period","supply period","usage period","period from")):
             mm = list(date_pat.finditer(ln))
             if len(mm) >= 2:
                 ds, de = _parse_date(mm[0]), _parse_date(mm[-1])
@@ -313,7 +276,7 @@ def parse_bill_text(txt: str) -> dict:
     if not period_found:
         cands = []
         for i, ln in enumerate(lines):
-            if any(k in ln for k in ("period", " from ", " to ")):
+            if any(k in ln for k in ("period"," from "," to ")):
                 for m in date_pat.finditer(ln):
                     d = _parse_date(m)
                     if d: cands.append((i, d))
@@ -324,96 +287,51 @@ def parse_bill_text(txt: str) -> dict:
             if ds and de and de >= ds:
                 result["period_start"] = ds.date().isoformat()
                 result["period_end"] = de.date().isoformat()
-
-    # --- 2) Supply charge (c/day or $/day) ---
-    supply_pat = re.compile(
-        r'(supply|daily)\s+(charge|service|fixed)[^0-9]*(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$|cent|cents)\s*\/?\s*(day|d)\b',
-        re.IGNORECASE
-    )
+    supply_pat = re.compile(r'(supply|daily)\s+(charge|service|fixed)[^0-9]*(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$|cent|cents)\s*\/\s*(day|d)\b', re.IGNORECASE)
     for ln in lines:
         m = supply_pat.search(ln)
         if m:
             cents = _to_cents(_clean_num(m.group("val")), m.group("unit"))
             result["supply_cents_per_day"] = round(cents, 4)
             break
-
-    # --- 3) Money total (prefer context, avoid refs & account numbers) ---
-    # Strategy:
-    #  a) look on the same line as keywords for $amounts
-    #  b) if not found, look within +/- 1 line window for $amounts
-    #  c) if still not found, look for decimal amounts near keywords (no $), but cap to sane values
-    prefer_keys = (
-        "new charges",
-        "total for this bill",
-        "electricity charges",
-        "charges this bill",
-        "amount due",
-        "total balance",
-    )
-    bad_ctx = ("account number", "ref:", "customer number", "nmi", "biller code", "crn")
-
-    # Require a $ for primary matches; allow 1–5 digits before optional thousands (we cap later anyway)
+    prefer_keys = ("new charges","total for this bill","electricity charges","charges this bill","amount due","total balance")
+    bad_ctx = ("account number","ref:","customer number","nmi","biller code","crn")
     dollar_amt = re.compile(r'\$\s*\d{1,5}(?:,\d{3})*(?:\.\d{2})?')
-    # Secondary: decimal-only amounts like 131.08 (no $) near the keyword lines
     decimal_amt = re.compile(r'(?<!\d)(\d{1,5}(?:,\d{3})*\.\d{2})(?!\d)')
-
-    candidates = []
-    key_line_indexes = []
-
+    candidates = []; key_line_indexes = []
     for i, ln in enumerate(pretty_lines):
         low = ln.lower()
         if any(k in low for k in prefer_keys) and not any(b in low for b in bad_ctx):
             key_line_indexes.append(i)
-            # same line with $
             for m in dollar_amt.finditer(ln):
                 candidates.append((i, _clean_num(m.group(0))))
-            # window +/- 1 line for $
             for j in (i - 1, i + 1):
                 if 0 <= j < len(pretty_lines):
                     for m in dollar_amt.finditer(pretty_lines[j]):
                         candidates.append((j, _clean_num(m.group(0))))
-            # window +/- 1 line for decimal-only amounts
             for j in (i, i - 1, i + 1):
                 if 0 <= j < len(pretty_lines):
                     for m in decimal_amt.finditer(pretty_lines[j]):
                         candidates.append((j, _clean_num(m.group(1))))
-
     if candidates:
-        # Drop insane values and anything 0/negative
         filtered = [(idx, amt) for idx, amt in candidates if 0 < amt < 10000]
         if filtered:
-            # Choose the one closest to the most recent keyword line; break ties by larger value
             last_key_idx = max(key_line_indexes) if key_line_indexes else 0
             filtered.sort(key=lambda x: (abs(x[0] - last_key_idx), -x[1]))
             result["total_cost_inc_gst"] = round(filtered[0][1], 2)
-
-
-    # --- 4) Rates & kWh: FLAT vs TIERED ---
-    # Accept: "27.731 c/kwh", "$0.277/kwh", "27.731 cents/kwh"
     rate_pat = re.compile(r'(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$|cent|cents)\s*(?:/| per )\s*kwh')
     kwh_pat  = re.compile(r'(?<![\d\.])(?P<kwh>\d{1,6}(?:\.\d+)?)\s*kwh\b')
-
-    # Also match rows like "215.119 kwh @ 27.731 c/kwh"
-    row_pat = re.compile(
-        r'(?P<kwh>\d{1,6}(?:\.\d+)?)\s*kwh[^@\n]*@\s*(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$|cent|cents)\s*(?:/| per )\s*kwh'
-    )
-
-    rate_hits = []  # (i, cents_value, line)
+    row_pat = re.compile(r'(?P<kwh>\d{1,6}(?:\.\d+)?)\s*kwh[^@\n]*@\s*(?P<val>\d{1,4}(?:\.\d+)?)\s*(?P<unit>[c¢]|\$|cent|cents)\s*(?:/| per )\s*kwh')
+    rate_hits = []
     for i, ln in enumerate(lines):
         for m in rate_pat.finditer(ln):
             cents = _to_cents(_clean_num(m.group("val")), m.group("unit"))
             rate_hits.append((i, round(cents, 4), ln))
-
-    step1 = {}
-    step2 = {}
-    flat_val = None
-
+    step1 = {}; step2 = {}; flat_val = None
     def _bucket_from_text(s: str) -> str:
-        if any(w in s for w in ("first", "initial", "step 1", "tier 1", "block 1")): return "step1"
-        if any(w in s for w in ("next", "remaining", "step 2", "tier 2", "block 2")): return "step2"
+        if any(w in s for w in ("first","initial","step 1","tier 1","block 1")): return "step1"
+        if any(w in s for w in ("next","remaining","step 2","tier 2","block 2")): return "step2"
         return ""
-
-    # 4a) Strong form: rows with "kwh @ rate"
     for ln in lines:
         m = row_pat.search(ln)
         if not m: continue
@@ -426,8 +344,6 @@ def parse_bill_text(txt: str) -> dict:
         elif bucket == "step2" and ("usage_cents_per_kwh_step2" not in step2):
             step2["usage_cents_per_kwh_step2"] = cents
             step2["step2_kwh"] = kwh_val
-
-    # 4b) If still missing, pair standalone rate lines with nearby kWh lines
     if not (step1 and step2):
         nearby = 2
         for (i, cents, ln) in rate_hits:
@@ -445,8 +361,6 @@ def parse_bill_text(txt: str) -> dict:
             elif bucket == "step2" and "usage_cents_per_kwh_step2" not in step2:
                 step2["usage_cents_per_kwh_step2"] = cents
                 if found_kw is not None: step2["step2_kwh"] = found_kw
-
-    # 4c) If still missing, infer by order of distinct rates
     if not step1 or not step2:
         distinct_rates = []
         for _, cents, _ in rate_hits:
@@ -457,8 +371,6 @@ def parse_bill_text(txt: str) -> dict:
             step2.setdefault("usage_cents_per_kwh_step2", distinct_rates[1])
         elif len(distinct_rates) == 1:
             flat_val = distinct_rates[0]
-
-    # Try to attach kWh to each inferred step by proximity
     if "step1_kwh" not in step1 or "step2_kwh" not in step2:
         for (i, cents, ln) in rate_hits:
             win = lines[max(0, i-2): i+3]
@@ -470,14 +382,11 @@ def parse_bill_text(txt: str) -> dict:
                         step1.setdefault("step1_kwh", kw)
                     if "usage_cents_per_kwh_step2" in step2 and abs(cents - step2["usage_cents_per_kwh_step2"]) < 1e-6:
                         step2.setdefault("step2_kwh", kw)
-
-    # ---- Tiered kWh per step (if printed) ----
     tier_blocks = _extract_tier_blocks(pretty_lines)
     if tier_blocks:
-        # Match kWhs to whichever step rate they align to (within 0.2c tolerance)
         tol = 0.2
-        s1 = result.get("usage_cents_per_kwh_step1")
-        s2 = result.get("usage_cents_per_kwh_step2")
+        s1 = step1.get("usage_cents_per_kwh_step1")
+        s2 = step2.get("usage_cents_per_kwh_step2")
         step1_kwh = step2_kwh = 0.0
         for kwh, cents in tier_blocks:
             if s1 is not None and abs(cents - s1) <= tol:
@@ -488,15 +397,11 @@ def parse_bill_text(txt: str) -> dict:
             result["step1_kwh"] = round(step1_kwh, 3)
         if step2_kwh:
             result["step2_kwh"] = round(step2_kwh, 3)
-        # If total_kwh missing or obviously too small, rebuild it
         if (not result.get("total_kwh")) or result.get("total_kwh", 0) < (step1_kwh + step2_kwh)*0.9:
             result["total_kwh"] = round(step1_kwh + step2_kwh, 3)
-
-
-    # --- 5) Total kWh ---
     total_kwh = 0.0
     for ln in lines:
-        if any(k in ln for k in ("total usage", "usage this bill", "total kwh", "energy used")):
+        if any(k in ln for k in ("total usage","usage this bill","total kwh","energy used")):
             m = kwh_pat.search(ln)
             if m:
                 total_kwh = _clean_num(m.group("kwh"))
@@ -508,21 +413,13 @@ def parse_bill_text(txt: str) -> dict:
             total_kwh = s1 + s2
     if total_kwh:
         result["total_kwh"] = round(total_kwh, 3)
-
-    # --- 6) Decide tariff_type + write fields ---
     if step1 and step2:
-        result["tariff_type"] = "TIERED"
-        result.update(step1)
-        result.update(step2)
+        result["tariff_type"] = "TIERED"; result.update(step1); result.update(step2)
     elif flat_val is not None and "tariff_type" not in result:
-        result["tariff_type"] = "FLAT"
-        result["usage_cents_per_kwh"] = round(flat_val, 4)
+        result["tariff_type"] = "FLAT"; result["usage_cents_per_kwh"] = round(flat_val, 4)
     else:
         if rate_hits and not (step1 and step2):
-            result["tariff_type"] = "FLAT"
-            result["usage_cents_per_kwh"] = round(rate_hits[0][1], 4)
-
-    # --- 7) daily_kwh if possible ---
+            result["tariff_type"] = "FLAT"; result["usage_cents_per_kwh"] = round(rate_hits[0][1], 4)
     if "total_kwh" in result and "period_start" in result and "period_end" in result:
         try:
             ds = datetime.fromisoformat(result["period_start"])
@@ -531,10 +428,15 @@ def parse_bill_text(txt: str) -> dict:
             result["daily_kwh"] = round(float(result["total_kwh"]) / days, 2)
         except Exception:
             pass
-
+    if "supply_cents_per_day" in result and not (10 <= result["supply_cents_per_day"] <= 300):
+        result.pop("supply_cents_per_day", None)
+    if "usage_cents_per_kwh_step1" in result and not (5 <= result["usage_cents_per_kwh_step1"] <= 100):
+        result.pop("usage_cents_per_kwh_step1", None)
+    if "usage_cents_per_kwh_step2" in result and not (5 <= result["usage_cents_per_kwh_step2"] <= 100):
+        result.pop("usage_cents_per_kwh_step2", None)
+    if "total_cost_inc_gst" in result and not (0 < result["total_cost_inc_gst"] < 10000):
+        result.pop("total_cost_inc_gst", None)
     return result
-
-# ---------- Bytes -> structured bill profile ----------
 def parse_bill_bytes(content: bytes, content_type: str) -> dict:
     """
     Extract text from PDF/image bytes, parse with parse_bill_text,
@@ -953,10 +855,10 @@ def whatsapp_webhook():
             "Hi! I'm SwitchBuddy.\n\n"
             "Please send a photo or PDF of your electricity bill.\n\n"
             "When you're finished:\n"
-            "â€¢ Reply: 'add another bill' to upload more\n"
-            "â€¢ Reply: 'that's all' to finish\n"
-            "â€¢ Reply: 'list bills' to see what I've saved\n"
-            "â€¢ Reply: 'digest' to get your weekly digest link"
+            "• Reply: 'add another bill' to upload more\n"
+            "• Reply: 'that's all' to finish\n"
+            "• Reply: 'list bills' to see what I've saved\n"
+            "• Reply: 'digest' to get your weekly digest link"
         )
         return str(resp)
 
@@ -1015,7 +917,7 @@ def whatsapp_webhook():
 
     if said_any("add another bill", "add another", "another bill", "add more", "upload another"):
         r.set(k_state, "collecting")
-        msg.body("Cool â€” send the next bill photo/PDF. When finished, say 'that's all'.")
+        msg.body("Cool — send the next bill photo/PDF. When finished, say 'that's all'.")
         return str(resp)
 
     # Media handling (Twilio sends MediaUrl0/MediaContentType0 when files attached)
@@ -1081,13 +983,13 @@ def whatsapp_webhook():
                 human_size = f"{size_bytes/1024/1024:.2f} MB"
 
             msg.body(
-                f"Bill received âœ… (#{new_count}).\n"
+                f"Bill received ✅ (#{new_count}).\n"
                 f"(Fetched media: {human_size})\n\n"
                 "Reply 'add another bill' to add more, 'list bills' to review, or 'that's all' to finish."
             )
         else:
             msg.body(
-                f"Bill received âœ… (#{new_count}).\n"
+                f"Bill received ✅ (#{new_count}).\n"
                 "Heads up: I couldn't fetch the file from Twilio just now, but the link was saved. "
                 "You can try sending it again, or proceed.\n\n"
                 "Reply 'add another bill' to add more, 'list bills' to review, or 'that's all' to finish."
@@ -1097,7 +999,7 @@ def whatsapp_webhook():
     # Fallbacks based on state
     if state == "collecting":
         msg.body(
-            "I'm ready â€” please send a photo/PDF of your bill.\n"
+            "I'm ready — please send a photo/PDF of your bill.\n"
             "Or say 'that's all' when you're finished."
         )
     elif state == "done":
@@ -1109,27 +1011,6 @@ def whatsapp_webhook():
     else:
         msg.body("Say 'hi' to get started with your bill upload.")
     return str(resp)
-
-    summary_bits = []
-    if parsed.get("tariff_type"):
-        summary_bits.append(f"Tariff: {parsed['tariff_type']}")
-    if parsed.get("usage_cents_per_kwh_step1") is not None:
-        summary_bits.append(f"S1: {parsed['usage_cents_per_kwh_step1']}c/kWh")
-    if parsed.get("usage_cents_per_kwh_step2") is not None:
-        summary_bits.append(f"S2: {parsed['usage_cents_per_kwh_step2']}c/kWh")
-    if parsed.get("step1_kwh") is not None:
-        summary_bits.append(f"S1 kWh: {parsed['step1_kwh']}")
-    if parsed.get("step2_kwh") is not None:
-        summary_bits.append(f"S2 kWh: {parsed['step2_kwh']}")
-    if parsed.get("supply_cents_per_day") is not None:
-        summary_bits.append(f"Supply: {parsed['supply_cents_per_day']}c/day")
-    if parsed.get("total_kwh") is not None:
-        summary_bits.append(f"Total kWh: {parsed['total_kwh']}")
-    if parsed.get("total_cost_inc_gst") is not None:
-        summary_bits.append(f"Bill: ${parsed['total_cost_inc_gst']:.2f}")
-
-    if summary_bits:
-        msg.body("Parsed:\n• " + "\n• ".join(summary_bits))
 
 
 # -----------------------------
