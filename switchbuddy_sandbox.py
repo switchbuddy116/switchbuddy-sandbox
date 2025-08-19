@@ -160,6 +160,29 @@ def download_twilio_media(media_url: str, timeout=15):
     return content, content_type, (content_length if content_length is not None else len(content))
 
 # ---------- OCR & parsing pipeline ----------
+# ---------- Helper: extract (kWh, cents/kWh) tier rows from pretty OCR lines ----------
+def _extract_tier_blocks(pretty_lines):
+    """
+    Return list of (kwh, cents_per_kwh) found in lines like:
+      "215.119 kWh @ 27.731 c/kWh" or "Step 1 300 kWh @ 20.1 c/kWh".
+    """
+    import re
+    out = []
+    pat = re.compile(
+        r'(?P<kwh>\d{1,6}(?:\.\d+)?)\s*kwh[^@\n]*@\s*'
+        r'(?P<val>\d{1,4}(?:\.\d+)?)\s*(?:c|¢|cent|cents)\s*/\s*kwh',
+        re.IGNORECASE
+    )
+    for ln in pretty_lines:
+        for m in pat.finditer(ln):
+            try:
+                kwh = float(m.group("kwh").replace(",", ""))
+                cents = float(m.group("val").replace(",", ""))
+                out.append((kwh, cents))
+            except Exception:
+                pass
+    return out
+
 def ocr_extract_text(content: bytes, content_type: str) -> str:
     """
     Extract text from bytes using:
